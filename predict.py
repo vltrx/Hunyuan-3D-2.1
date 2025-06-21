@@ -255,10 +255,35 @@ class Predictor(BasePredictor):
             
             # Post-process mesh
             logger.info(f"  Post-processing mesh for {image_name}")
+            
+            # Basic cleanup
             mesh_output = self.floater_remove_worker(mesh_output)
+            if mesh_output is None or len(mesh_output.vertices) == 0 or len(mesh_output.faces) == 0:
+                raise RuntimeError("Mesh became empty after floater removal")
+                
             mesh_output = self.degenerate_face_remove_worker(mesh_output)
-            mesh_output = self.mesh_simplifier(mesh_output)
+            if mesh_output is None or len(mesh_output.vertices) == 0 or len(mesh_output.faces) == 0:
+                raise RuntimeError("Mesh became empty after degenerate face removal")
+            
+            # Optional mesh simplification (skip if binary missing)
+            mesh_before_simplify = mesh_output
+            try:
+                simplified_mesh = self.mesh_simplifier(mesh_output)
+                if simplified_mesh is None or len(simplified_mesh.vertices) == 0 or len(simplified_mesh.faces) == 0:
+                    logger.warning("  Mesh simplifier returned empty mesh, skipping simplification")
+                    mesh_output = mesh_before_simplify  # Keep original mesh
+                else:
+                    logger.info(f"  Mesh simplified successfully")
+                    mesh_output = simplified_mesh
+            except Exception as e:
+                logger.warning(f"  Mesh simplification failed ({str(e)}), continuing without simplification")
+                mesh_output = mesh_before_simplify  # Keep original mesh
+            
+            # Face reduction (always needed)
             mesh_output = self.face_reduce_worker(mesh_output, max_facenum=kwargs.get('max_facenum', 40000))
+            if mesh_output is None or len(mesh_output.vertices) == 0 or len(mesh_output.faces) == 0:
+                raise RuntimeError("Mesh became empty after face reduction")
+                
             self._cleanup_gpu_memory()
 
             # Save intermediate mesh
