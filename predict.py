@@ -98,7 +98,7 @@ class Predictor(BasePredictor):
         os.environ["OMP_NUM_THREADS"] = "1"
         os.environ["U2NET_HOME"] = U2NET_PATH
 
-        mc_algo = "dmc"
+        mc_algo = "mc"  # Use standard marching cubes for compatibility
 
         # Download required models
         download_if_not_exists(U2NET_URL, U2NET_PATH)
@@ -248,6 +248,10 @@ class Predictor(BasePredictor):
 
             logger.info(f"  Shape generated, peak VRAM: {self.vram_monitor.get_used_vram():.1f}GB")
             self._cleanup_gpu_memory()
+            
+            # Check if mesh generation was successful
+            if mesh_output is None:
+                raise RuntimeError("Mesh generation returned None - surface extraction failed")
             
             # Post-process mesh
             logger.info(f"  Post-processing mesh for {image_name}")
