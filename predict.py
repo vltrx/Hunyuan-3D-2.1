@@ -10,25 +10,60 @@ import requests
 from typing import List, Optional, Union
 import gc
 
+import torch
 from PIL import Image
 from torch import cuda, Generator
 from cog import BasePredictor, BaseModel, Input, Path
 
-# Add the necessary paths for the new module structure
+# HuggingFace-style environment setup (from their gradio_app.py)
+def setup_environment():
+    """Setup environment variables for optimal CUDA performance"""
+    os.environ["CUDA_HOME"] = "/usr/local/cuda"
+    os.environ["PATH"] = f"{os.environ.get('CUDA_HOME', '/usr/local/cuda')}/bin:{os.environ.get('PATH', '')}"
+    os.environ["LD_LIBRARY_PATH"] = f"{os.environ.get('CUDA_HOME', '/usr/local/cuda')}/lib64:{os.environ.get('LD_LIBRARY_PATH', '')}"
+    os.environ["TORCH_CUDA_ARCH_LIST"] = "8.0;8.6"
+    
+    # Ensure CUDA toolkit is available
+    print(f"CUDA_HOME: {os.environ.get('CUDA_HOME')}")
+    print(f"PATH: {os.environ.get('PATH')}")
+    print(f"LD_LIBRARY_PATH: {os.environ.get('LD_LIBRARY_PATH')}")
+    print(f"TORCH_CUDA_ARCH_LIST: {os.environ.get('TORCH_CUDA_ARCH_LIST')}")
+
+# Setup environment before importing anything else
+setup_environment()
+
+# Add paths for the model modules
 sys.path.insert(0, './hy3dshape')
 sys.path.insert(0, './hy3dpaint')
+
+# Apply torchvision fix early
+try:
+    from torchvision_fix import apply_fix
+    apply_fix()
+    print("Applied torchvision compatibility fix")
+except ImportError:
+    print("Warning: torchvision_fix module not found, proceeding without compatibility fix")
+except Exception as e:
+    print(f"Warning: Failed to apply torchvision fix: {e}")
 
 from hy3dshape.rembg import BackgroundRemover
 from hy3dshape.postprocessors import FaceReducer, FloaterRemover, DegenerateFaceRemover, MeshSimplifier
 from hy3dshape.pipelines import Hunyuan3DDiTFlowMatchingPipeline
 from hy3dshape.models.autoencoders import SurfaceExtractors
 from hy3dshape.utils import logger
-from hy3dpaint.textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
+
+# Use HF-style import pattern for texture generation
+try:
+    from textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
+    print("Using HF-style textureGenPipeline import")
+except ImportError:
+    # Fallback to full path if needed
+    from hy3dpaint.textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
+    print("Using fallback hy3dpaint.textureGenPipeline import")
 
 CHECKPOINTS_PATH = "/src/checkpoints"
-HUNYUAN3D_REPO = "tencent/Hunyuan3D-2.1"
-HUNYUAN3D_DIT_MODEL = "hunyuan3d-dit-v2-1"
-HUNYUAN3D_PAINT_MODEL = "hunyuan3d-paint-v2-1"
+# Simplified constants following HF demo.py pattern
+HUNYUAN3D_MODEL_PATH = "tencent/Hunyuan3D-2.1"
 U2NET_PATH = os.path.join(CHECKPOINTS_PATH, ".u2net/")
 U2NET_URL = "https://weights.replicate.delivery/default/comfy-ui/rembg/u2net.onnx.tar"
 REALESRGAN_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"
@@ -84,61 +119,82 @@ class VRAMMonitor:
 
 class Predictor(BasePredictor):
     def setup(self) -> None:
-        start = time.time()
-        logger.info("Setup started")
+        """Load the model into memory to make running multiple predictions efficient"""
         
-        # Apply torchvision compatibility fix before any imports
-        try:
-            from torchvision_fix import apply_fix
-            apply_fix()
-            logger.info("Applied torchvision compatibility fix")
-        except Exception as e:
-            logger.warning(f"Failed to apply torchvision fix: {e}")
+        logger.info("Setup started")
         
         os.environ["OMP_NUM_THREADS"] = "1"
         os.environ["U2NET_HOME"] = U2NET_PATH
-
-        mc_algo = "mc"  # Use standard marching cubes for compatibility
-
-        # Download required models
-        download_if_not_exists(U2NET_URL, U2NET_PATH)
         
-        # Download RealESRGAN model
-        realesrgan_path = "hy3dpaint/ckpt/RealESRGAN_x4plus.pth"
-        download_file_if_not_exists(REALESRGAN_URL, realesrgan_path)
-
-        # Load shape generation pipeline
+        logger.info("Loading background removal model...")
+        self.rmbg_worker = BackgroundRemover()
+        
+        logger.info("Loading shape generation model...")
         self.i23d_worker = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
-            HUNYUAN3D_REPO,
-            subfolder=HUNYUAN3D_DIT_MODEL,
+            HUNYUAN3D_MODEL_PATH  # Simplified, no subfolder needed
         )
-        self.i23d_worker.enable_flashvdm(mc_algo=mc_algo)
-        self.i23d_worker.vae.surface_extractor = SurfaceExtractors[mc_algo]()
-
-        # Load texture generation pipeline
-        max_num_view = 6
-        resolution = 512
-        texgen_config = Hunyuan3DPaintConfig(max_num_view, resolution)
-        texgen_config.realesrgan_ckpt_path = realesrgan_path
-        texgen_config.multiview_cfg_path = "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
-        texgen_config.custom_pipeline = "hy3dpaint/hunyuanpaintpbr"
-        texgen_config.multiview_pretrained_path = HUNYUAN3D_REPO
         
-        self.texgen_worker = Hunyuan3DPaintPipeline(texgen_config)
-
-        # Load post-processing workers
+        # Enable low VRAM mode for better memory management (HF-style)
+        if hasattr(self.i23d_worker, 'enable_model_cpu_offload'):
+            self.i23d_worker.enable_model_cpu_offload()
+            logger.info("Enabled CPU offload for shape model")
+        
+        logger.info("Loading texture generation model...")
+        try:
+            # Use HF-style configuration exactly as shown in demo.py
+            max_num_view = 6  # can be 6 to 9
+            resolution = 512  # can be 768 or 512
+            conf = Hunyuan3DPaintConfig(max_num_view, resolution)
+            conf.realesrgan_ckpt_path = "hy3dpaint/ckpt/RealESRGAN_x4plus.pth"
+            conf.multiview_cfg_path = "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
+            conf.custom_pipeline = "hy3dpaint/hunyuanpaintpbr"
+            self.tex_pipeline = Hunyuan3DPaintPipeline(conf)
+            logger.info("Texture generation model loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to load texture generator: {e}")
+            raise e
+        
+        logger.info("Loading mesh processing tools...")
         self.floater_remove_worker = FloaterRemover()
         self.degenerate_face_remove_worker = DegenerateFaceRemover()
         self.face_reduce_worker = FaceReducer()
-        self.rmbg_worker = BackgroundRemover()
         self.mesh_simplifier = MeshSimplifier()
-
-        # Initialize VRAM monitor
+        
+        # Initialize VRAM monitor (HF-style)
         self.vram_monitor = VRAMMonitor()
+        
+        # Initial GPU memory cleanup (HF-style)
+        self.cleanup_gpu_memory()
+        
+        logger.info("Setup completed")
+    
+    def cleanup_gpu_memory(self):
+        """Clean up GPU memory between predictions"""
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            # Force garbage collection
+            import gc
+            gc.collect()
 
-        duration = time.time() - start
-        logger.info(f"Setup took: {duration:.2f}s")
-        logger.info(f"Available VRAM: {self.vram_monitor.get_available_vram():.1f}GB")
+    def _generate_shape(self, image, steps, guidance_scale, seed, octree_resolution, num_chunks):
+        """Generate 3D shape from image"""
+        generator = torch.Generator()
+        generator = generator.manual_seed(int(seed))
+        
+        outputs = self.i23d_worker(
+            image=image,
+            num_inference_steps=steps,
+            guidance_scale=guidance_scale,
+            generator=generator,
+            octree_resolution=octree_resolution,
+            num_chunks=num_chunks,
+            output_type='mesh'
+        )
+        
+        # Clean up GPU memory after generation (HF-style)
+        self.cleanup_gpu_memory()
+        
+        return outputs
 
     def _cleanup_gpu_memory(self):
         """Aggressive GPU memory cleanup"""
@@ -216,13 +272,13 @@ class Predictor(BasePredictor):
             generator = Generator().manual_seed(kwargs.get('seed', 1234) + image_idx)
             
             try:
-                mesh_output = self.i23d_worker(
-                    image=input_image,
-                    num_inference_steps=kwargs.get('steps', 50),
-                    guidance_scale=kwargs.get('guidance_scale', 5.0),
-                    generator=generator,
-                    octree_resolution=kwargs.get('octree_resolution', 512),
-                    num_chunks=kwargs.get('num_chunks', 8000),
+                mesh_output = self._generate_shape(
+                    input_image,
+                    kwargs.get('steps', 50),
+                    kwargs.get('guidance_scale', 5.0),
+                    kwargs.get('seed', 1234) + image_idx,
+                    kwargs.get('octree_resolution', 512),
+                    kwargs.get('num_chunks', 8000)
                 )[0]
             except Exception as shape_error:
                 logger.error(f"  Shape generation failed: {str(shape_error)}")
@@ -231,13 +287,13 @@ class Predictor(BasePredictor):
                 if "non-zero size" in str(shape_error) or "empty" in str(shape_error).lower():
                     logger.info(f"  Retrying with modified parameters...")
                     try:
-                        mesh_output = self.i23d_worker(
-                            image=input_image,
-                            num_inference_steps=max(30, kwargs.get('steps', 50) - 10),
-                            guidance_scale=min(kwargs.get('guidance_scale', 5.0) + 1.0, 10.0),
-                            generator=generator,
-                            octree_resolution=max(256, kwargs.get('octree_resolution', 512) - 128),
-                            num_chunks=kwargs.get('num_chunks', 8000),
+                        mesh_output = self._generate_shape(
+                            input_image,
+                            max(30, kwargs.get('steps', 50) - 10),
+                            min(kwargs.get('guidance_scale', 5.0) + 1.0, 10.0),
+                            kwargs.get('seed', 1234) + image_idx + 999,
+                            max(256, kwargs.get('octree_resolution', 512) - 128),
+                            kwargs.get('num_chunks', 8000)
                         )[0]
                         logger.info(f"  Retry successful with modified parameters")
                     except Exception as retry_error:
@@ -278,15 +334,14 @@ class Predictor(BasePredictor):
                     logger.info(f"  🔄 Retrying with enhanced parameters...")
                     
                     # Retry with parameters that help generate more 3D geometry
-                    enhanced_generator = Generator().manual_seed(kwargs.get('seed', 1234) + image_idx + 999)
                     try:
-                        retry_mesh = self.i23d_worker(
-                            image=input_image,
-                            num_inference_steps=min(kwargs.get('steps', 50) + 10, 60),  # More steps
-                            guidance_scale=min(kwargs.get('guidance_scale', 5.0) + 3.0, 12.0),  # Much higher guidance
-                            generator=enhanced_generator,
-                            octree_resolution=min(kwargs.get('octree_resolution', 512) + 128, 640),  # Higher resolution
-                            num_chunks=max(kwargs.get('num_chunks', 8000) - 2000, 6000),  # Fewer chunks for more detail
+                        retry_mesh = self._generate_shape(
+                            input_image,
+                            min(kwargs.get('steps', 50) + 10, 60),  # More steps
+                            min(kwargs.get('guidance_scale', 5.0) + 3.0, 12.0),  # Much higher guidance
+                            kwargs.get('seed', 1234) + image_idx + 999,  # Different seed
+                            min(kwargs.get('octree_resolution', 512) + 128, 640),  # Higher resolution
+                            max(kwargs.get('num_chunks', 8000) - 2000, 6000)  # Fewer chunks for more detail
                         )[0]
                         
                         if retry_mesh is not None and hasattr(retry_mesh, 'bounds'):
@@ -355,11 +410,10 @@ class Predictor(BasePredictor):
 
             # Apply texturing
             logger.info(f"  Generating texture for {image_name}")
-            textured_mesh_path = self.texgen_worker(
+            textured_mesh_path = self.tex_pipeline(
                 mesh_path=temp_mesh_path,
                 image_path=input_image,
-                output_mesh_path=os.path.join(output_dir, f"{image_name}_textured.obj"),
-                save_glb=False
+                output_mesh_path=os.path.join(output_dir, f"{image_name}_textured.obj")
             )
 
             # Export final GLB
@@ -518,11 +572,10 @@ class Predictor(BasePredictor):
                 temp_mesh_path = "output/temp_mesh.obj"
                 mesh_obj.export(temp_mesh_path)
 
-                textured_mesh_path = self.texgen_worker(
+                textured_mesh_path = self.tex_pipeline(
                     mesh_path=temp_mesh_path,
                     image_path=input_image,
-                    output_mesh_path="output/textured_mesh.obj",
-                    save_glb=False
+                    output_mesh_path="output/textured_mesh.obj"
                 )
                 final_mesh = load_trimesh(textured_mesh_path)
 
