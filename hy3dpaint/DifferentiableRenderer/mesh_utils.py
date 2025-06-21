@@ -206,6 +206,8 @@ def save_mesh(mesh_path, vtx_pos, pos_idx, vtx_uv, uv_idx, texture, metallic=Non
 
 def _setup_blender_scene():
     """Setup Blender scene for conversion."""
+    if not HAS_BLENDER:
+        return
     if "convert" not in bpy.data.scenes:
         bpy.data.scenes.new("convert")
     bpy.context.window.scene = bpy.data.scenes["convert"]
@@ -213,6 +215,8 @@ def _setup_blender_scene():
 
 def _clear_scene_objects():
     """Clear all objects from current Blender scene."""
+    if not HAS_BLENDER:
+        return
     for obj in bpy.context.scene.objects:
         obj.select_set(True)
         bpy.data.objects.remove(obj, do_unlink=True)
