@@ -1,0 +1,43 @@
+name: Push to Replicate
+
+on:
+  # Allows manual triggering from GitHub.com
+  workflow_dispatch:
+    inputs:
+      model_name:
+        description: "Model name to push (default: vltrx/hunyuan3d-2-1)"
+        required: false
+        default: "vltrx/hunyuan3d-2-1"
+  # Uncomment the lines below to trigger on every push to main
+  # push:
+  #   branches:
+  #     - main
+
+jobs:
+  push_to_replicate:
+    name: Push to Replicate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          docker-images: false
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Cog
+        uses: replicate/setup-cog@v2
+        with:
+          version: "0.12.1"
+          token: ${{ secrets.REPLICATE_API_TOKEN }}
+
+      - name: Push to Replicate
+        run: |
+          if [ -n "${{ github.event.inputs.model_name }}" ]; then
+            cog push r8.im/${{ github.event.inputs.model_name }}
+          else
+            cog push r8.im/vltrx/hunyuan3d-2-1
+          fi 
