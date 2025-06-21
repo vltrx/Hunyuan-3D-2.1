@@ -35,8 +35,11 @@ except:
 
 try:
     from .mesh_inpaint_processor import meshVerticeInpaint  # , meshVerticeColor
+    HAS_MESH_INPAINT = True
 except:
     print("InPaint Function CAN NOT BE Imported!!!")
+    HAS_MESH_INPAINT = False
+    meshVerticeInpaint = None
 
 
 class RenderMode(Enum):
@@ -1403,9 +1406,11 @@ class MeshRender:
         if isinstance(mask, torch.Tensor):
             mask = (mask.squeeze(-1).cpu().numpy() * 255).astype(np.uint8)
 
-        if vertex_inpaint:
+        if vertex_inpaint and HAS_MESH_INPAINT:
             vtx_pos, pos_idx, vtx_uv, uv_idx = self.get_mesh()
             texture_np, mask = meshVerticeInpaint(texture_np, mask, vtx_pos, vtx_uv, pos_idx, uv_idx)
+        elif vertex_inpaint and not HAS_MESH_INPAINT:
+            print("Warning: Mesh vertex inpainting requested but not available. Skipping vertex inpainting step.")
 
         if method == "NS":
             texture_np = cv2.inpaint((texture_np * 255).astype(np.uint8), 255 - mask, 3, cv2.INPAINT_NS)
