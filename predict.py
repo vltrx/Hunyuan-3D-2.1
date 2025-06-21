@@ -264,10 +264,17 @@ class Predictor(BasePredictor):
                 # Check if mesh is degenerate (very flat) and retry if needed
                 min_dimension = min(size)
                 max_dimension = max(size)
-                is_flat = min_dimension < 0.01 or mesh_output.volume < 0.001
+                dimension_ratio = min_dimension / max_dimension if max_dimension > 0 else 0
+                
+                # More sensitive detection for flat geometry
+                is_flat = (
+                    min_dimension < 0.1 or  # Increased threshold
+                    mesh_output.volume < 0.01 or  # Increased threshold  
+                    dimension_ratio < 0.15  # New: detect when one dimension is much smaller
+                )
                 
                 if is_flat:
-                    logger.warning(f"  ⚠️  Detected flat mesh - min dimension: {min_dimension:.6f}, volume: {mesh_output.volume:.6f}")
+                    logger.warning(f"  ⚠️  Detected flat mesh - min dimension: {min_dimension:.6f}, volume: {mesh_output.volume:.6f}, ratio: {dimension_ratio:.3f}")
                     logger.info(f"  🔄 Retrying with enhanced parameters...")
                     
                     # Retry with parameters that help generate more 3D geometry
@@ -275,25 +282,31 @@ class Predictor(BasePredictor):
                     try:
                         retry_mesh = self.i23d_worker(
                             image=input_image,
-                            num_inference_steps=kwargs.get('steps', 50),
-                            guidance_scale=min(kwargs.get('guidance_scale', 5.0) + 2.0, 10.0),  # Higher guidance
+                            num_inference_steps=min(kwargs.get('steps', 50) + 10, 60),  # More steps
+                            guidance_scale=min(kwargs.get('guidance_scale', 5.0) + 3.0, 12.0),  # Much higher guidance
                             generator=enhanced_generator,
                             octree_resolution=min(kwargs.get('octree_resolution', 512) + 128, 640),  # Higher resolution
-                            num_chunks=kwargs.get('num_chunks', 8000),
+                            num_chunks=max(kwargs.get('num_chunks', 8000) - 2000, 6000),  # Fewer chunks for more detail
                         )[0]
                         
                         if retry_mesh is not None and hasattr(retry_mesh, 'bounds'):
                             retry_bounds = retry_mesh.bounds
                             retry_size = retry_bounds[1] - retry_bounds[0]
                             retry_min_dim = min(retry_size)
+                            retry_max_dim = max(retry_size)
+                            retry_ratio = retry_min_dim / retry_max_dim if retry_max_dim > 0 else 0
                             retry_volume = retry_mesh.volume
                             
-                            # Check if retry improved the geometry
-                            if retry_min_dim > min_dimension and retry_volume > mesh_output.volume:
-                                logger.info(f"  ✅ Retry improved geometry - new min dim: {retry_min_dim:.6f}, volume: {retry_volume:.6f}")
+                            # Check if retry improved the geometry (focus on dimension ratio and volume)
+                            improved_ratio = retry_ratio > dimension_ratio * 1.5  # At least 50% better ratio
+                            improved_volume = retry_volume > mesh_output.volume * 2.0  # At least 2x volume
+                            improved_min_dim = retry_min_dim > min_dimension * 1.5  # At least 50% thicker
+                            
+                            if improved_ratio or improved_volume or improved_min_dim:
+                                logger.info(f"  ✅ Retry improved geometry - ratio: {retry_ratio:.3f} (was {dimension_ratio:.3f}), volume: {retry_volume:.6f} (was {mesh_output.volume:.6f})")
                                 mesh_output = retry_mesh
                             else:
-                                logger.info(f"  ⚠️  Retry didn't improve significantly, keeping original")
+                                logger.info(f"  ⚠️  Retry didn't improve significantly - ratio: {retry_ratio:.3f}, volume: {retry_volume:.6f}, keeping original")
                         else:
                             logger.info(f"  ⚠️  Retry failed, keeping original mesh")
                             
