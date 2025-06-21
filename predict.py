@@ -54,12 +54,13 @@ def download_file_if_not_exists(url, dest_path):
         logger.info(f"downloading took: {duration:.2f}s")
 
 class Output(BaseModel):
+    # Single mode outputs
     mesh: Optional[Path] = None
-
-class BatchOutput(BaseModel):
-    meshes: List[Path]
-    failed_images: List[str]
-    processing_stats: dict
+    
+    # Batch mode outputs (when batch_mode=True)
+    meshes: Optional[List[Path]] = None
+    failed_images: Optional[List[str]] = None
+    processing_stats: Optional[dict] = None
 
 class VRAMMonitor:
     """Monitor VRAM usage for batch processing safety"""
@@ -309,7 +310,7 @@ class Predictor(BasePredictor):
             ge=1,
             le=25,
         ),
-    ) -> Union[Output, BatchOutput]:
+    ) -> Output:
         
         start_time = time.time()
 
@@ -413,7 +414,7 @@ class Predictor(BasePredictor):
     def _predict_batch(self, 
                       images: str, 
                       max_batch_size: int,
-                      **kwargs) -> BatchOutput:
+                      **kwargs) -> Output:
         """
         Sequential batch processing with robust error handling
         """
@@ -528,7 +529,7 @@ class Predictor(BasePredictor):
         
         self._log_analytics_event("batch_completed", stats)
         
-        return BatchOutput(
+        return Output(
             meshes=successful_meshes,
             failed_images=failed_images,
             processing_stats=stats
