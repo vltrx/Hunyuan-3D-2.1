@@ -14,11 +14,18 @@
 
 import os
 import cv2
-import bpy
 import math
 import numpy as np
 from io import StringIO
 from typing import Optional, Tuple, Dict, Any
+
+# Optional Blender import - only needed for GLB conversion
+try:
+    import bpy
+    HAS_BLENDER = True
+except ImportError:
+    HAS_BLENDER = False
+    bpy = None
 
 
 def _safe_extract_attribute(obj: Any, attr_path: str, default: Any = None) -> Any:
@@ -265,6 +272,10 @@ def convert_obj_to_glb(
     merge_vertices: bool = False,
 ) -> bool:
     """Convert OBJ file to GLB format using Blender."""
+    if not HAS_BLENDER:
+        print("Warning: Blender (bpy) not available. Cannot convert OBJ to GLB.")
+        return False
+        
     try:
         _setup_blender_scene()
         _clear_scene_objects()
