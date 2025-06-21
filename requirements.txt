@@ -1,4 +1,4 @@
---extra-index-url https://download.pytorch.org/whl/cu124
+--extra-index-url https://download.pytorch.org/whl/cu121
 pybind11==2.13.4
 diffusers==0.30.0
 einops==0.8.0
@@ -25,7 +25,7 @@ timm
 safetensors==0.4.4
 omegaconf==2.3.0
 pyyaml==6.0.2
-cupy-cuda12x==13.4.1
+cupy-cuda12x==13.0.0
 huggingface-hub==0.30.2
 requests==2.31.0
 
