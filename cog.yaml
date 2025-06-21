@@ -15,9 +15,9 @@ build:
     - curl -o /usr/local/bin/pget -L "https://github.com/replicate/pget/releases/latest/download/pget_$(uname -s)_$(uname -m)" && chmod +x /usr/local/bin/pget
     - echo "Setting up HuggingFace-style environment..." && export CUDA_HOME=/usr/local/cuda && export PATH=${CUDA_HOME}/bin:${PATH} && export LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH} && export TORCH_CUDA_ARCH_LIST="8.0;8.6"
     - echo "Cloning repository for wheel building..." && (git clone https://github.com/vltrx/Hunyuan-3D-2.1 /tmp/repo)
-    - echo "Building custom_rasterizer wheel..." && (cd /tmp/repo/hy3dpaint/custom_rasterizer && export TORCH_CUDA_ARCH_LIST="8.0;8.6" && python setup.py bdist_wheel) && cp /tmp/repo/hy3dpaint/custom_rasterizer/dist/custom_rasterizer-0.1-*.whl /tmp/custom_rasterizer.whl
-    - echo "Installing precompiled wheel..." && pip install /tmp/custom_rasterizer.whl
+    - echo "Building custom_rasterizer wheel..." && (cd /tmp/repo/hy3dpaint/custom_rasterizer && export TORCH_CUDA_ARCH_LIST="8.0;8.6" && python setup.py bdist_wheel)
+    - echo "Installing precompiled wheel..." && pip install /tmp/repo/hy3dpaint/custom_rasterizer/dist/custom_rasterizer-*.whl
     - echo "Compiling DifferentiableRenderer..." && (cd /tmp/repo/hy3dpaint/DifferentiableRenderer && export TORCH_CUDA_ARCH_LIST="8.0;8.6" && bash compile_mesh_painter.sh) && cp -r /tmp/repo/hy3dpaint/DifferentiableRenderer /tmp/DifferentiableRenderer
-    - echo "Cleanup..." && rm -rf /tmp/repo && rm -f /tmp/custom_rasterizer.whl
+    - echo "Cleanup..." && rm -rf /tmp/repo
 
 predict: "predict.py:Predictor" 
