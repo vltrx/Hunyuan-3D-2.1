@@ -253,6 +253,56 @@ class Predictor(BasePredictor):
             if mesh_output is None:
                 raise RuntimeError("Mesh generation returned None - surface extraction failed")
             
+            # Add detailed mesh diagnostics
+            logger.info(f"  Generated mesh - Vertices: {len(mesh_output.vertices)}, Faces: {len(mesh_output.faces)}")
+            if hasattr(mesh_output, 'bounds'):
+                bounds = mesh_output.bounds
+                size = bounds[1] - bounds[0]
+                logger.info(f"  Mesh bounds: {bounds}, Size: {size}")
+                logger.info(f"  Mesh volume: {mesh_output.volume:.6f}")
+                
+                # Check if mesh is degenerate (very flat) and retry if needed
+                min_dimension = min(size)
+                max_dimension = max(size)
+                is_flat = min_dimension < 0.01 or mesh_output.volume < 0.001
+                
+                if is_flat:
+                    logger.warning(f"  ⚠️  Detected flat mesh - min dimension: {min_dimension:.6f}, volume: {mesh_output.volume:.6f}")
+                    logger.info(f"  🔄 Retrying with enhanced parameters...")
+                    
+                    # Retry with parameters that help generate more 3D geometry
+                    enhanced_generator = Generator().manual_seed(kwargs.get('seed', 1234) + image_idx + 999)
+                    try:
+                        retry_mesh = self.i23d_worker(
+                            image=input_image,
+                            num_inference_steps=kwargs.get('steps', 50),
+                            guidance_scale=min(kwargs.get('guidance_scale', 5.0) + 2.0, 10.0),  # Higher guidance
+                            generator=enhanced_generator,
+                            octree_resolution=min(kwargs.get('octree_resolution', 512) + 128, 640),  # Higher resolution
+                            num_chunks=kwargs.get('num_chunks', 8000),
+                        )[0]
+                        
+                        if retry_mesh is not None and hasattr(retry_mesh, 'bounds'):
+                            retry_bounds = retry_mesh.bounds
+                            retry_size = retry_bounds[1] - retry_bounds[0]
+                            retry_min_dim = min(retry_size)
+                            retry_volume = retry_mesh.volume
+                            
+                            # Check if retry improved the geometry
+                            if retry_min_dim > min_dimension and retry_volume > mesh_output.volume:
+                                logger.info(f"  ✅ Retry improved geometry - new min dim: {retry_min_dim:.6f}, volume: {retry_volume:.6f}")
+                                mesh_output = retry_mesh
+                            else:
+                                logger.info(f"  ⚠️  Retry didn't improve significantly, keeping original")
+                        else:
+                            logger.info(f"  ⚠️  Retry failed, keeping original mesh")
+                            
+                    except Exception as retry_error:
+                        logger.warning(f"  ⚠️  Retry failed with error: {str(retry_error)}, keeping original")
+                
+            else:
+                logger.info("  Mesh bounds info not available")
+            
             # Post-process mesh
             logger.info(f"  Post-processing mesh for {image_name}")
             
