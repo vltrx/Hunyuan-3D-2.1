@@ -86,6 +86,15 @@ class Predictor(BasePredictor):
     def setup(self) -> None:
         start = time.time()
         logger.info("Setup started")
+        
+        # Apply torchvision compatibility fix before any imports
+        try:
+            from torchvision_fix import apply_fix
+            apply_fix()
+            logger.info("Applied torchvision compatibility fix")
+        except Exception as e:
+            logger.warning(f"Failed to apply torchvision fix: {e}")
+        
         os.environ["OMP_NUM_THREADS"] = "1"
         os.environ["U2NET_HOME"] = U2NET_PATH
 
