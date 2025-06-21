@@ -28,4 +28,7 @@ pyyaml==6.0.2
 cupy-cuda12x==13.0.0
 huggingface-hub==0.30.2
 requests==2.31.0
+pytorch-lightning==2.2.5
+wandb
+tensorboard
 
