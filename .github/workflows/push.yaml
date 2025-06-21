@@ -8,10 +8,10 @@ on:
         description: "Model name to push (default: vltrx/hunyuan3d-2-1)"
         required: false
         default: "vltrx/hunyuan3d-2-1"
-  # Uncomment the lines below to trigger on every push to main
-  # push:
-  #   branches:
-  #     - main
+  # Trigger on every push to main
+  push:
+    branches:
+      - main
 
 jobs:
   push_to_replicate:
