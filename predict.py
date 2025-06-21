@@ -187,21 +187,64 @@ class Predictor(BasePredictor):
             # Background removal
             if kwargs.get('remove_background', True):
                 logger.info(f"  Removing background for {image_name}")
+                original_size = input_image.size
                 input_image = self.rmbg_worker(input_image)
+                
+                # Check if background removal resulted in empty/invalid image
+                if input_image.size != original_size:
+                    logger.info(f"  Background removal changed size: {original_size} → {input_image.size}")
+                    
+                # Check for completely transparent or empty image
+                import numpy as np
+                img_array = np.array(input_image.convert('RGBA'))
+                if len(img_array.shape) == 3 and img_array.shape[2] == 4:  # Has alpha channel
+                    alpha_channel = img_array[:, :, 3]
+                    non_transparent_pixels = np.sum(alpha_channel > 0)
+                    total_pixels = alpha_channel.size
+                    transparency_ratio = non_transparent_pixels / total_pixels
+                    logger.info(f"  Image transparency: {transparency_ratio:.2%} opaque pixels")
+                    
+                    if transparency_ratio < 0.05:  # Less than 5% opaque pixels
+                        logger.warning(f"  Image is mostly transparent after background removal ({transparency_ratio:.2%} opaque)")
+                
                 self._cleanup_gpu_memory()
 
             logger.info(f"  Generating 3D shape for {image_name}")
             
             # Generate shape
+            logger.info(f"  Input image size: {input_image.size}, mode: {input_image.mode}")
             generator = Generator().manual_seed(kwargs.get('seed', 1234) + image_idx)
-            mesh_output = self.i23d_worker(
-                image=input_image,
-                num_inference_steps=kwargs.get('steps', 50),
-                guidance_scale=kwargs.get('guidance_scale', 5.0),
-                generator=generator,
-                octree_resolution=kwargs.get('octree_resolution', 512),
-                num_chunks=kwargs.get('num_chunks', 8000),
-            )[0]
+            
+            try:
+                mesh_output = self.i23d_worker(
+                    image=input_image,
+                    num_inference_steps=kwargs.get('steps', 50),
+                    guidance_scale=kwargs.get('guidance_scale', 5.0),
+                    generator=generator,
+                    octree_resolution=kwargs.get('octree_resolution', 512),
+                    num_chunks=kwargs.get('num_chunks', 8000),
+                )[0]
+            except Exception as shape_error:
+                logger.error(f"  Shape generation failed: {str(shape_error)}")
+                
+                # Try with different parameters if it's a geometry issue
+                if "non-zero size" in str(shape_error) or "empty" in str(shape_error).lower():
+                    logger.info(f"  Retrying with modified parameters...")
+                    try:
+                        mesh_output = self.i23d_worker(
+                            image=input_image,
+                            num_inference_steps=max(30, kwargs.get('steps', 50) - 10),
+                            guidance_scale=min(kwargs.get('guidance_scale', 5.0) + 1.0, 10.0),
+                            generator=generator,
+                            octree_resolution=max(256, kwargs.get('octree_resolution', 512) - 128),
+                            num_chunks=kwargs.get('num_chunks', 8000),
+                        )[0]
+                        logger.info(f"  Retry successful with modified parameters")
+                    except Exception as retry_error:
+                        logger.error(f"  Retry also failed: {str(retry_error)}")
+                        raise shape_error  # Raise original error
+                else:
+                    raise shape_error
 
             logger.info(f"  Shape generated, peak VRAM: {self.vram_monitor.get_used_vram():.1f}GB")
             self._cleanup_gpu_memory()
