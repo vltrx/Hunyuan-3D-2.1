@@ -187,3 +187,5 @@ exploration.
    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=Tencent-Hunyuan/Hunyuan3D-2.1&type=Date" />
  </picture>
 </a>
+#   R e p o s i t o r y   i s   n o w   p u b l i c   a n d   r e a d y   f o r   d e p l o y m e n t  
+ 
