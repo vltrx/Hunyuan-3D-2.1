@@ -292,6 +292,28 @@ class Predictor(BasePredictor):
                 total_pixels = alpha_array.size
                 transparency_ratio = opaque_pixels / total_pixels
                 logger.info(f"  Image transparency: {transparency_ratio*100:.2f}% opaque pixels")
+                
+                # IMMEDIATE DEBUG: Test if we can reach this line
+                logger.info("  DEBUG: Line immediately after transparency logging reached")
+                
+                # IMMEDIATE DEBUG: Test variable cleanup
+                del alpha, alpha_array, opaque_pixels, total_pixels, transparency_ratio
+                logger.info("  DEBUG: Variables cleaned up successfully")
+                
+                # Force garbage collection to prevent memory issues
+                import gc
+                gc.collect()
+                logger.info("  DEBUG: Garbage collection completed")
+                
+                # Clear any potential GPU memory issues
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    logger.info("  DEBUG: CUDA cache cleared")
+            else:
+                logger.info("  DEBUG: No alpha channel found, skipping transparency check")
+            
+            # IMMEDIATE DEBUG: Test if we can reach shape generation section
+            logger.info("  DEBUG: About to start shape generation section")
             
             # DEBUG: Add checkpoint logs to identify where process hangs
             logger.info("  DEBUG: About to start shape generation timing")
