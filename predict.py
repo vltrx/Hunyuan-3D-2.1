@@ -49,7 +49,7 @@ except Exception as e:
 
 from hy3dshape.rembg import BackgroundRemover
 from hy3dshape.postprocessors import FaceReducer, FloaterRemover, DegenerateFaceRemover, MeshSimplifier
-from hy3dshape.pipelines import Hunyuan3DDiTFlowMatchingPipeline
+from hy3dshape.pipelines import Hunyuan3DDiTFlowMatchingPipeline, export_to_trimesh
 from hy3dshape.models.autoencoders import SurfaceExtractors
 from hy3dshape.utils import logger
 
@@ -234,7 +234,12 @@ class Predictor(BasePredictor):
             output_type='mesh'
         )
         
-        return outputs
+        # Convert to trimesh using HF demo pattern
+        logger.info("  Converting Latent2MeshOutput to trimesh...")
+        mesh = export_to_trimesh(outputs)[0]
+        logger.info(f"  Converted to mesh - Vertices: {len(mesh.vertices)}, Faces: {len(mesh.faces)}")
+        
+        return [mesh]  # Return as list to match expected format
 
     def _generate_shape(self, image, steps, guidance_scale, seed, octree_resolution, num_chunks):
         """Generate 3D shape from image"""
