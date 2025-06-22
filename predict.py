@@ -205,7 +205,7 @@ class Predictor(BasePredictor):
         
         logger.info("Setup completed using HF-style lazy-loaded workers")
     
-    def cleanup_gpu_memory(self):
+    def _cleanup_gpu_memory(self):
         """Clean up GPU memory between predictions"""
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
