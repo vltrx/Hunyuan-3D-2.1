@@ -18,7 +18,7 @@ build:
     - echo "Building custom_rasterizer wheel..." && (cd /tmp/repo/hy3dpaint/custom_rasterizer && export TORCH_CUDA_ARCH_LIST="8.0;8.6" && python setup.py bdist_wheel)
     - echo "Installing precompiled wheel..." && pip install /tmp/repo/hy3dpaint/custom_rasterizer/dist/custom_rasterizer-*.whl
     - echo "Compiling DifferentiableRenderer..." && (cd /tmp/repo/hy3dpaint/DifferentiableRenderer && export TORCH_CUDA_ARCH_LIST="8.0;8.6" && bash compile_mesh_painter.sh) && cp -r /tmp/repo/hy3dpaint/DifferentiableRenderer /tmp/DifferentiableRenderer
-    - echo "Downloading RealESRGAN model..." && mkdir -p hy3dpaint/ckpt && wget https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth -O hy3dpaint/ckpt/RealESRGAN_x4plus.pth
+    - echo "Downloading RealESRGAN model..." && mkdir -p /src/hy3dpaint/ckpt && wget https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth -O /src/hy3dpaint/ckpt/RealESRGAN_x4plus.pth
     - echo "Cleanup..." && rm -rf /tmp/repo
 
 predict: "predict.py:Predictor" 
