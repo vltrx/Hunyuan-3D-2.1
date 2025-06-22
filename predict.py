@@ -134,10 +134,18 @@ class Predictor(BasePredictor):
             HUNYUAN3D_MODEL_PATH  # Simplified, no subfolder needed
         )
         
-        # Enable low VRAM mode for better memory management (HF-style)
-        if hasattr(self.i23d_worker, 'enable_model_cpu_offload'):
-            self.i23d_worker.enable_model_cpu_offload()
-            logger.info("Enabled CPU offload for shape model")
+        # Try to enable low VRAM mode if available (HF-style approach)
+        try:
+            if hasattr(self.i23d_worker, 'enable_model_cpu_offload'):
+                self.i23d_worker.enable_model_cpu_offload()
+                logger.info("Enabled CPU offload for shape model")
+            else:
+                logger.info("CPU offload not available for this pipeline")
+        except AttributeError as e:
+            logger.warning(f"CPU offload not supported for this pipeline: {e}")
+        except Exception as e:
+            logger.warning(f"Failed to enable CPU offload: {e}")
+            # Continue without CPU offload
         
         logger.info("Loading texture generation model...")
         try:
