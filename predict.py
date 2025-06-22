@@ -9,6 +9,7 @@ import io
 import requests
 from typing import List, Optional, Union
 import gc
+import numpy as np
 
 import torch
 from PIL import Image
@@ -198,6 +199,12 @@ class Predictor(BasePredictor):
 
     def _generate_shape(self, image, steps, guidance_scale, seed, octree_resolution, num_chunks):
         """Generate 3D shape from image"""
+        import time
+        start_time = time.time()
+        
+        logger.info(f"  Starting shape generation with {steps} steps, guidance_scale={guidance_scale}")
+        logger.info(f"  GPU Memory before generation: {torch.cuda.memory_allocated()/1024**3:.2f}GB / {torch.cuda.max_memory_allocated()/1024**3:.2f}GB")
+        
         generator = torch.Generator()
         generator = generator.manual_seed(int(seed))
         
@@ -210,6 +217,10 @@ class Predictor(BasePredictor):
             num_chunks=num_chunks,
             output_type='mesh'
         )
+        
+        generation_time = time.time() - start_time
+        logger.info(f"  Shape generation completed in {generation_time:.1f} seconds")
+        logger.info(f"  GPU Memory after generation: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
         
         # Clean up GPU memory after generation (HF-style)
         self.cleanup_gpu_memory()
@@ -261,81 +272,49 @@ class Predictor(BasePredictor):
                 image_name = f"image_{image_idx}"
 
             # Background removal
-            if kwargs.get('remove_background', True):
-                logger.info(f"  Removing background for {image_name}")
-                original_size = input_image.size
-                input_image = self.rmbg_worker(input_image)
-                
-                # Check if background removal resulted in empty/invalid image
-                if input_image.size != original_size:
-                    logger.info(f"  Background removal changed size: {original_size} → {input_image.size}")
-                    
-                # Check for completely transparent or empty image
-                import numpy as np
-                img_array = np.array(input_image.convert('RGBA'))
-                if len(img_array.shape) == 3 and img_array.shape[2] == 4:  # Has alpha channel
-                    alpha_channel = img_array[:, :, 3]
-                    non_transparent_pixels = np.sum(alpha_channel > 0)
-                    total_pixels = alpha_channel.size
-                    transparency_ratio = non_transparent_pixels / total_pixels
-                    logger.info(f"  Image transparency: {transparency_ratio:.2%} opaque pixels")
-                    
-                    if transparency_ratio < 0.05:  # Less than 5% opaque pixels
-                        logger.warning(f"  Image is mostly transparent after background removal ({transparency_ratio:.2%} opaque)")
-                
-                self._cleanup_gpu_memory()
-
-            logger.info(f"  Generating 3D shape for {image_name}")
+            logger.info(f"  Removing background for {image_name}")
+            processed_image = self.rmbg_worker(input_image)
             
-            # Generate shape
-            logger.info(f"  Input image size: {input_image.size}, mode: {input_image.mode}")
-            generator = Generator().manual_seed(kwargs.get('seed', 1234) + image_idx)
+            # Log transparency info
+            if hasattr(processed_image, 'getchannel'):
+                alpha = processed_image.getchannel('A')
+                alpha_array = np.array(alpha)
+                opaque_pixels = np.sum(alpha_array > 0)
+                total_pixels = alpha_array.size
+                transparency_ratio = opaque_pixels / total_pixels
+                logger.info(f"  Image transparency: {transparency_ratio*100:.2f}% opaque pixels")
             
-            try:
-                mesh_output = self._generate_shape(
-                    input_image,
-                    kwargs.get('steps', 50),
-                    kwargs.get('guidance_scale', 5.0),
-                    kwargs.get('seed', 1234) + image_idx,
-                    kwargs.get('octree_resolution', 512),
-                    kwargs.get('num_chunks', 8000)
-                )[0]
-            except Exception as shape_error:
-                logger.error(f"  Shape generation failed: {str(shape_error)}")
-                
-                # Try with different parameters if it's a geometry issue
-                if "non-zero size" in str(shape_error) or "empty" in str(shape_error).lower():
-                    logger.info(f"  Retrying with modified parameters...")
-                    try:
-                        mesh_output = self._generate_shape(
-                            input_image,
-                            max(30, kwargs.get('steps', 50) - 10),
-                            min(kwargs.get('guidance_scale', 5.0) + 1.0, 10.0),
-                            kwargs.get('seed', 1234) + image_idx + 999,
-                            max(256, kwargs.get('octree_resolution', 512) - 128),
-                            kwargs.get('num_chunks', 8000)
-                        )[0]
-                        logger.info(f"  Retry successful with modified parameters")
-                    except Exception as retry_error:
-                        logger.error(f"  Retry also failed: {str(retry_error)}")
-                        raise shape_error  # Raise original error
-                else:
-                    raise shape_error
-
-            logger.info(f"  Shape generated, peak VRAM: {self.vram_monitor.get_used_vram():.1f}GB")
+            # Start timing shape generation
+            shape_start_time = time.time()
+            logger.info(f"  Beginning shape generation at {time.strftime('%H:%M:%S')}")
+            
+            # Generate 3D shape
+            outputs = self._generate_shape(
+                processed_image, 
+                kwargs.get('steps', 50),
+                kwargs.get('guidance_scale', 5.0), 
+                kwargs.get('seed', 1234) + image_idx,
+                kwargs.get('octree_resolution', 512),
+                kwargs.get('num_chunks', 8000)
+            )
+            
+            shape_total_time = time.time() - shape_start_time
+            logger.info(f"  Total shape pipeline time: {shape_total_time:.1f} seconds")
+            
+            # Clean up GPU memory after generation (HF-style)
             self._cleanup_gpu_memory()
             
             # Check if mesh generation was successful
-            if mesh_output is None:
+            if outputs is None:
                 raise RuntimeError("Mesh generation returned None - surface extraction failed")
             
             # Add detailed mesh diagnostics
-            logger.info(f"  Generated mesh - Vertices: {len(mesh_output.vertices)}, Faces: {len(mesh_output.faces)}")
-            if hasattr(mesh_output, 'bounds'):
-                bounds = mesh_output.bounds
+            logger.info(f"  Generated mesh - Vertices: {len(outputs[0].vertices)}, Faces: {len(outputs[0].faces)}")
+            if hasattr(outputs[0], 'bounds'):
+                bounds = outputs[0].bounds
                 size = bounds[1] - bounds[0]
                 logger.info(f"  Mesh bounds: {bounds}, Size: {size}")
-                logger.info(f"  Mesh volume: {mesh_output.volume:.6f}")
+                logger.info(f"  Mesh volume: {outputs[0].volume:.6f}")
                 
                 # Check if mesh is degenerate (very flat) and retry if needed
                 min_dimension = min(size)
@@ -345,18 +324,18 @@ class Predictor(BasePredictor):
                 # More sensitive detection for flat geometry
                 is_flat = (
                     min_dimension < 0.1 or  # Increased threshold
-                    mesh_output.volume < 0.01 or  # Increased threshold  
+                    outputs[0].volume < 0.01 or  # Increased threshold  
                     dimension_ratio < 0.15  # New: detect when one dimension is much smaller
                 )
                 
                 if is_flat:
-                    logger.warning(f"  ⚠️  Detected flat mesh - min dimension: {min_dimension:.6f}, volume: {mesh_output.volume:.6f}, ratio: {dimension_ratio:.3f}")
+                    logger.warning(f"  ⚠️  Detected flat mesh - min dimension: {min_dimension:.6f}, volume: {outputs[0].volume:.6f}, ratio: {dimension_ratio:.3f}")
                     logger.info(f"  🔄 Retrying with enhanced parameters...")
                     
                     # Retry with parameters that help generate more 3D geometry
                     try:
                         retry_mesh = self._generate_shape(
-                            input_image,
+                            processed_image,
                             min(kwargs.get('steps', 50) + 10, 60),  # More steps
                             min(kwargs.get('guidance_scale', 5.0) + 3.0, 12.0),  # Much higher guidance
                             kwargs.get('seed', 1234) + image_idx + 999,  # Different seed
@@ -374,12 +353,12 @@ class Predictor(BasePredictor):
                             
                             # Check if retry improved the geometry (focus on dimension ratio and volume)
                             improved_ratio = retry_ratio > dimension_ratio * 1.5  # At least 50% better ratio
-                            improved_volume = retry_volume > mesh_output.volume * 2.0  # At least 2x volume
+                            improved_volume = retry_volume > outputs[0].volume * 2.0  # At least 2x volume
                             improved_min_dim = retry_min_dim > min_dimension * 1.5  # At least 50% thicker
                             
                             if improved_ratio or improved_volume or improved_min_dim:
-                                logger.info(f"  ✅ Retry improved geometry - ratio: {retry_ratio:.3f} (was {dimension_ratio:.3f}), volume: {retry_volume:.6f} (was {mesh_output.volume:.6f})")
-                                mesh_output = retry_mesh
+                                logger.info(f"  ✅ Retry improved geometry - ratio: {retry_ratio:.3f} (was {dimension_ratio:.3f}), volume: {retry_volume:.6f} (was {outputs[0].volume:.6f})")
+                                outputs[0] = retry_mesh
                             else:
                                 logger.info(f"  ⚠️  Retry didn't improve significantly - ratio: {retry_ratio:.3f}, volume: {retry_volume:.6f}, keeping original")
                         else:
@@ -395,7 +374,7 @@ class Predictor(BasePredictor):
             logger.info(f"  Post-processing mesh for {image_name}")
             
             # Basic cleanup
-            mesh_output = self.floater_remove_worker(mesh_output)
+            mesh_output = self.floater_remove_worker(outputs[0])
             if mesh_output is None or len(mesh_output.vertices) == 0 or len(mesh_output.faces) == 0:
                 raise RuntimeError("Mesh became empty after floater removal")
                 
