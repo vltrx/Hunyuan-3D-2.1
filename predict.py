@@ -62,8 +62,52 @@ except ImportError:
     from hy3dpaint.textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
     print("Using fallback hy3dpaint.textureGenPipeline import")
 
+# HF-style module-level model initialization
+print("Initializing models at module level (HF-style)...")
+
+# Initialize background removal worker
+print("Loading background removal model...")
+rmbg_worker = BackgroundRemover()
+
+# Initialize shape generation model  
+print("Loading shape generation model...")
+i23d_worker = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
+    "tencent/Hunyuan3D-2.1"
+)
+
+# Initialize texture generation model
+print("Loading texture generation model...")
+max_num_view = 6
+resolution = 512
+tex_conf = Hunyuan3DPaintConfig(max_num_view, resolution)
+tex_conf.realesrgan_ckpt_path = "hy3dpaint/ckpt/RealESRGAN_x4plus.pth"
+tex_conf.multiview_cfg_path = "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
+tex_conf.custom_pipeline = "hy3dpaint/hunyuanpaintpbr"
+
+# Fallback: Download RealESRGAN model if missing
+if not os.path.exists(tex_conf.realesrgan_ckpt_path):
+    print("RealESRGAN model not found, downloading as fallback...")
+    os.makedirs(os.path.dirname(tex_conf.realesrgan_ckpt_path), exist_ok=True)
+    subprocess.run([
+        "wget", 
+        "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
+        "-O", tex_conf.realesrgan_ckpt_path
+    ], check=True)
+    print("RealESRGAN model downloaded successfully")
+
+tex_pipeline = Hunyuan3DPaintPipeline(tex_conf)
+
+# Initialize mesh processing workers
+print("Loading mesh processing tools...")
+floater_remove_worker = FloaterRemover()
+degenerate_face_remove_worker = DegenerateFaceRemover()
+face_reduce_worker = FaceReducer()
+mesh_simplifier = MeshSimplifier()
+
+print("All models initialized successfully (HF-style)")
+
+# Constants
 CHECKPOINTS_PATH = "/src/checkpoints"
-# Simplified constants following HF demo.py pattern
 HUNYUAN3D_MODEL_PATH = "tencent/Hunyuan3D-2.1"
 U2NET_PATH = os.path.join(CHECKPOINTS_PATH, ".u2net/")
 U2NET_URL = "https://weights.replicate.delivery/default/comfy-ui/rembg/u2net.onnx.tar"
@@ -124,78 +168,54 @@ class Predictor(BasePredictor):
         
         logger.info("Setup started")
         
-        os.environ["OMP_NUM_THREADS"] = "1"
-        os.environ["U2NET_HOME"] = U2NET_PATH
+        # HF-style: Use module-level workers (already initialized)
+        logger.info("Using module-level workers (HF-style)")
+        self.rmbg_worker = rmbg_worker
+        self.i23d_worker = i23d_worker
+        self.tex_pipeline = tex_pipeline
+        self.floater_remove_worker = floater_remove_worker
+        self.degenerate_face_remove_worker = degenerate_face_remove_worker
+        self.face_reduce_worker = face_reduce_worker
+        self.mesh_simplifier = mesh_simplifier
         
-        logger.info("Loading background removal model...")
-        self.rmbg_worker = BackgroundRemover()
-        
-        logger.info("Loading shape generation model...")
-        self.i23d_worker = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
-            HUNYUAN3D_MODEL_PATH  # Simplified, no subfolder needed
-        )
-        
-        # Try to enable low VRAM mode if available (HF-style approach)
-        try:
-            if hasattr(self.i23d_worker, 'enable_model_cpu_offload'):
-                self.i23d_worker.enable_model_cpu_offload()
-                logger.info("Enabled CPU offload for shape model")
-            else:
-                logger.info("CPU offload not available for this pipeline")
-        except AttributeError as e:
-            logger.warning(f"CPU offload not supported for this pipeline: {e}")
-        except Exception as e:
-            logger.warning(f"Failed to enable CPU offload: {e}")
-            # Continue without CPU offload
-        
-        logger.info("Loading texture generation model...")
-        try:
-            # Use HF-style configuration exactly as shown in demo.py
-            max_num_view = 6  # can be 6 to 9
-            resolution = 512  # can be 768 or 512
-            conf = Hunyuan3DPaintConfig(max_num_view, resolution)
-            conf.realesrgan_ckpt_path = "hy3dpaint/ckpt/RealESRGAN_x4plus.pth"
-            conf.multiview_cfg_path = "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
-            conf.custom_pipeline = "hy3dpaint/hunyuanpaintpbr"
-            
-            # Fallback: Download RealESRGAN model if missing
-            if not os.path.exists(conf.realesrgan_ckpt_path):
-                logger.warning("RealESRGAN model not found, downloading as fallback...")
-                os.makedirs(os.path.dirname(conf.realesrgan_ckpt_path), exist_ok=True)
-                subprocess.run([
-                    "wget", 
-                    "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
-                    "-O", conf.realesrgan_ckpt_path
-                ], check=True)
-                logger.info("RealESRGAN model downloaded successfully")
-            
-            self.tex_pipeline = Hunyuan3DPaintPipeline(conf)
-            logger.info("Texture generation model loaded successfully")
-        except Exception as e:
-            logger.error(f"Failed to load texture generator: {e}")
-            raise e
-        
-        logger.info("Loading mesh processing tools...")
-        self.floater_remove_worker = FloaterRemover()
-        self.degenerate_face_remove_worker = DegenerateFaceRemover()
-        self.face_reduce_worker = FaceReducer()
-        self.mesh_simplifier = MeshSimplifier()
-        
-        # Initialize VRAM monitor (HF-style)
+        # Initialize VRAM monitor
         self.vram_monitor = VRAMMonitor()
         
-        # Initial GPU memory cleanup (HF-style)
-        self.cleanup_gpu_memory()
+        # Initial GPU memory cleanup
+        self._cleanup_gpu_memory()
         
-        logger.info("Setup completed")
+        logger.info("Setup completed using HF-style module-level workers")
     
     def cleanup_gpu_memory(self):
         """Clean up GPU memory between predictions"""
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            # Force garbage collection
-            import gc
+            torch.cuda.ipc_collect()
             gc.collect()
+            
+    # HF-style shape generation function (mimicking their exact pattern)
+    def _hf_style_gen_shape(self, image, steps=50, guidance_scale=5.0, seed=1234, 
+                           octree_resolution=512, num_chunks=8000):
+        """Generate shape using HF Space pattern with module-level workers"""
+        
+        logger.info(f"HF-style shape generation: steps={steps}, guidance_scale={guidance_scale}")
+        
+        # Use module-level worker directly (HF pattern)
+        generator = torch.Generator()
+        generator = generator.manual_seed(int(seed))
+        
+        # Direct call to module-level worker (exactly like HF Space)
+        outputs = i23d_worker(
+            image=image,
+            num_inference_steps=steps,
+            guidance_scale=guidance_scale,
+            generator=generator,
+            octree_resolution=octree_resolution,
+            num_chunks=num_chunks,
+            output_type='mesh'
+        )
+        
+        return outputs
 
     def _generate_shape(self, image, steps, guidance_scale, seed, octree_resolution, num_chunks):
         """Generate 3D shape from image"""
@@ -236,13 +256,6 @@ class Predictor(BasePredictor):
         
         return outputs
 
-    def _cleanup_gpu_memory(self):
-        """Aggressive GPU memory cleanup"""
-        if cuda.is_available():
-            cuda.empty_cache()
-            cuda.ipc_collect()
-            gc.collect()
-            
     def _check_memory_safety(self, min_required_gb: float = 30.0) -> bool:
         """Check if we have enough memory to proceed safely"""
         available = self.vram_monitor.get_available_vram()
@@ -282,7 +295,7 @@ class Predictor(BasePredictor):
 
             # Background removal
             logger.info(f"  Removing background for {image_name}")
-            processed_image = self.rmbg_worker(input_image)
+            processed_image = rmbg_worker(input_image)  # Use module-level worker directly
             
             # Log transparency info
             if hasattr(processed_image, 'getchannel'):
@@ -322,11 +335,11 @@ class Predictor(BasePredictor):
             shape_start_time = time.time()
             logger.info(f"  Beginning shape generation at {time.strftime('%H:%M:%S')}")
             
-            # DEBUG: Log before calling _generate_shape
-            logger.info("  DEBUG: About to call _generate_shape method")
+            # DEBUG: Log before calling HF-style generation
+            logger.info("  DEBUG: About to call HF-style shape generation")
             
-            # Generate 3D shape
-            outputs = self._generate_shape(
+            # Use HF-style shape generation (exactly like HF Space)
+            outputs = self._hf_style_gen_shape(
                 processed_image, 
                 kwargs.get('steps', 50),
                 kwargs.get('guidance_scale', 5.0), 
@@ -335,8 +348,8 @@ class Predictor(BasePredictor):
                 kwargs.get('num_chunks', 8000)
             )
             
-            # DEBUG: Log after _generate_shape returns
-            logger.info("  DEBUG: _generate_shape method returned")
+            # DEBUG: Log after HF-style generation returns
+            logger.info("  DEBUG: HF-style shape generation returned")
             
             shape_total_time = time.time() - shape_start_time
             logger.info(f"  Total shape pipeline time: {shape_total_time:.1f} seconds")
@@ -374,14 +387,15 @@ class Predictor(BasePredictor):
                     
                     # Retry with parameters that help generate more 3D geometry
                     try:
-                        retry_mesh = self._generate_shape(
+                        retry_outputs = self._hf_style_gen_shape(
                             processed_image,
                             min(kwargs.get('steps', 50) + 10, 60),  # More steps
                             min(kwargs.get('guidance_scale', 5.0) + 3.0, 12.0),  # Much higher guidance
                             kwargs.get('seed', 1234) + image_idx + 999,  # Different seed
                             min(kwargs.get('octree_resolution', 512) + 128, 640),  # Higher resolution
                             max(kwargs.get('num_chunks', 8000) - 2000, 6000)  # Fewer chunks for more detail
-                        )[0]
+                        )
+                        retry_mesh = retry_outputs[0]
                         
                         if retry_mesh is not None and hasattr(retry_mesh, 'bounds'):
                             retry_bounds = retry_mesh.bounds
@@ -413,19 +427,19 @@ class Predictor(BasePredictor):
             # Post-process mesh
             logger.info(f"  Post-processing mesh for {image_name}")
             
-            # Basic cleanup
-            mesh_output = self.floater_remove_worker(outputs[0])
+            # Basic cleanup using module-level workers (HF pattern)
+            mesh_output = floater_remove_worker(outputs[0])
             if mesh_output is None or len(mesh_output.vertices) == 0 or len(mesh_output.faces) == 0:
                 raise RuntimeError("Mesh became empty after floater removal")
                 
-            mesh_output = self.degenerate_face_remove_worker(mesh_output)
+            mesh_output = degenerate_face_remove_worker(mesh_output)
             if mesh_output is None or len(mesh_output.vertices) == 0 or len(mesh_output.faces) == 0:
                 raise RuntimeError("Mesh became empty after degenerate face removal")
             
             # Optional mesh simplification (skip if binary missing)
             mesh_before_simplify = mesh_output
             try:
-                simplified_mesh = self.mesh_simplifier(mesh_output)
+                simplified_mesh = mesh_simplifier(mesh_output)
                 if simplified_mesh is None or len(simplified_mesh.vertices) == 0 or len(simplified_mesh.faces) == 0:
                     logger.warning("  Mesh simplifier returned empty mesh, skipping simplification")
                     mesh_output = mesh_before_simplify  # Keep original mesh
@@ -437,7 +451,7 @@ class Predictor(BasePredictor):
                 mesh_output = mesh_before_simplify  # Keep original mesh
             
             # Face reduction (always needed)
-            mesh_output = self.face_reduce_worker(mesh_output, max_facenum=kwargs.get('max_facenum', 40000))
+            mesh_output = face_reduce_worker(mesh_output, max_facenum=kwargs.get('max_facenum', 40000))
             if mesh_output is None or len(mesh_output.vertices) == 0 or len(mesh_output.faces) == 0:
                 raise RuntimeError("Mesh became empty after face reduction")
                 
@@ -447,9 +461,9 @@ class Predictor(BasePredictor):
             temp_mesh_path = os.path.join(output_dir, f"{image_name}_temp.obj")
             mesh_output.export(temp_mesh_path)
 
-            # Apply texturing
+            # Apply texturing using module-level worker (HF pattern)
             logger.info(f"  Generating texture for {image_name}")
-            textured_mesh_path = self.tex_pipeline(
+            textured_mesh_path = tex_pipeline(
                 mesh_path=temp_mesh_path,
                 image_path=input_image,
                 output_mesh_path=os.path.join(output_dir, f"{image_name}_textured.obj")
