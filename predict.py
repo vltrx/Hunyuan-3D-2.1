@@ -205,8 +205,14 @@ class Predictor(BasePredictor):
         logger.info(f"  Starting shape generation with {steps} steps, guidance_scale={guidance_scale}")
         logger.info(f"  GPU Memory before generation: {torch.cuda.memory_allocated()/1024**3:.2f}GB / {torch.cuda.max_memory_allocated()/1024**3:.2f}GB")
         
+        # DEBUG: Log generator creation
+        logger.info("  DEBUG: Creating generator...")
         generator = torch.Generator()
         generator = generator.manual_seed(int(seed))
+        logger.info(f"  DEBUG: Generator created with seed {seed}")
+        
+        # DEBUG: Log before model pipeline call
+        logger.info("  DEBUG: About to call i23d_worker pipeline...")
         
         outputs = self.i23d_worker(
             image=image,
@@ -218,12 +224,15 @@ class Predictor(BasePredictor):
             output_type='mesh'
         )
         
+        # DEBUG: Log after model pipeline call
+        logger.info("  DEBUG: i23d_worker pipeline call completed")
+        
         generation_time = time.time() - start_time
         logger.info(f"  Shape generation completed in {generation_time:.1f} seconds")
         logger.info(f"  GPU Memory after generation: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
         
         # Clean up GPU memory after generation (HF-style)
-        self.cleanup_gpu_memory()
+        self._cleanup_gpu_memory()
         
         return outputs
 
@@ -284,9 +293,15 @@ class Predictor(BasePredictor):
                 transparency_ratio = opaque_pixels / total_pixels
                 logger.info(f"  Image transparency: {transparency_ratio*100:.2f}% opaque pixels")
             
+            # DEBUG: Add checkpoint logs to identify where process hangs
+            logger.info("  DEBUG: About to start shape generation timing")
+            
             # Start timing shape generation
             shape_start_time = time.time()
             logger.info(f"  Beginning shape generation at {time.strftime('%H:%M:%S')}")
+            
+            # DEBUG: Log before calling _generate_shape
+            logger.info("  DEBUG: About to call _generate_shape method")
             
             # Generate 3D shape
             outputs = self._generate_shape(
@@ -297,6 +312,9 @@ class Predictor(BasePredictor):
                 kwargs.get('octree_resolution', 512),
                 kwargs.get('num_chunks', 8000)
             )
+            
+            # DEBUG: Log after _generate_shape returns
+            logger.info("  DEBUG: _generate_shape method returned")
             
             shape_total_time = time.time() - shape_start_time
             logger.info(f"  Total shape pipeline time: {shape_total_time:.1f} seconds")
