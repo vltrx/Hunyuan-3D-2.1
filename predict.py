@@ -62,49 +62,65 @@ except ImportError:
     from hy3dpaint.textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
     print("Using fallback hy3dpaint.textureGenPipeline import")
 
-# HF-style module-level model initialization
-print("Initializing models at module level (HF-style)...")
+# Global variables for lazy loading (HF-style but conditional)
+rmbg_worker = None
+i23d_worker = None
+tex_pipeline = None
+floater_remove_worker = None
+degenerate_face_remove_worker = None
+face_reduce_worker = None
+mesh_simplifier = None
 
-# Initialize background removal worker
-print("Loading background removal model...")
-rmbg_worker = BackgroundRemover()
+def initialize_models():
+    """Initialize models lazily (HF-style but on-demand)"""
+    global rmbg_worker, i23d_worker, tex_pipeline
+    global floater_remove_worker, degenerate_face_remove_worker, face_reduce_worker, mesh_simplifier
+    
+    if rmbg_worker is not None:
+        return  # Already initialized
+    
+    print("Initializing models at runtime (HF-style)...")
 
-# Initialize shape generation model  
-print("Loading shape generation model...")
-i23d_worker = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
-    "tencent/Hunyuan3D-2.1"
-)
+    # Initialize background removal worker
+    print("Loading background removal model...")
+    rmbg_worker = BackgroundRemover()
 
-# Initialize texture generation model
-print("Loading texture generation model...")
-max_num_view = 6
-resolution = 512
-tex_conf = Hunyuan3DPaintConfig(max_num_view, resolution)
-tex_conf.realesrgan_ckpt_path = "hy3dpaint/ckpt/RealESRGAN_x4plus.pth"
-tex_conf.multiview_cfg_path = "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
-tex_conf.custom_pipeline = "hy3dpaint/hunyuanpaintpbr"
+    # Initialize shape generation model  
+    print("Loading shape generation model...")
+    i23d_worker = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
+        "tencent/Hunyuan3D-2.1"
+    )
 
-# Fallback: Download RealESRGAN model if missing
-if not os.path.exists(tex_conf.realesrgan_ckpt_path):
-    print("RealESRGAN model not found, downloading as fallback...")
-    os.makedirs(os.path.dirname(tex_conf.realesrgan_ckpt_path), exist_ok=True)
-    subprocess.run([
-        "wget", 
-        "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
-        "-O", tex_conf.realesrgan_ckpt_path
-    ], check=True)
-    print("RealESRGAN model downloaded successfully")
+    # Initialize texture generation model
+    print("Loading texture generation model...")
+    max_num_view = 6
+    resolution = 512
+    tex_conf = Hunyuan3DPaintConfig(max_num_view, resolution)
+    tex_conf.realesrgan_ckpt_path = "hy3dpaint/ckpt/RealESRGAN_x4plus.pth"
+    tex_conf.multiview_cfg_path = "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
+    tex_conf.custom_pipeline = "hy3dpaint/hunyuanpaintpbr"
 
-tex_pipeline = Hunyuan3DPaintPipeline(tex_conf)
+    # Fallback: Download RealESRGAN model if missing
+    if not os.path.exists(tex_conf.realesrgan_ckpt_path):
+        print("RealESRGAN model not found, downloading as fallback...")
+        os.makedirs(os.path.dirname(tex_conf.realesrgan_ckpt_path), exist_ok=True)
+        subprocess.run([
+            "wget", 
+            "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
+            "-O", tex_conf.realesrgan_ckpt_path
+        ], check=True)
+        print("RealESRGAN model downloaded successfully")
 
-# Initialize mesh processing workers
-print("Loading mesh processing tools...")
-floater_remove_worker = FloaterRemover()
-degenerate_face_remove_worker = DegenerateFaceRemover()
-face_reduce_worker = FaceReducer()
-mesh_simplifier = MeshSimplifier()
+    tex_pipeline = Hunyuan3DPaintPipeline(tex_conf)
 
-print("All models initialized successfully (HF-style)")
+    # Initialize mesh processing workers
+    print("Loading mesh processing tools...")
+    floater_remove_worker = FloaterRemover()
+    degenerate_face_remove_worker = DegenerateFaceRemover()
+    face_reduce_worker = FaceReducer()
+    mesh_simplifier = MeshSimplifier()
+
+    print("All models initialized successfully (HF-style)")
 
 # Constants
 CHECKPOINTS_PATH = "/src/checkpoints"
@@ -168,8 +184,11 @@ class Predictor(BasePredictor):
         
         logger.info("Setup started")
         
-        # HF-style: Use module-level workers (already initialized)
-        logger.info("Using module-level workers (HF-style)")
+        # Lazy model initialization (HF-style but on-demand)
+        initialize_models()
+        
+        # Use the now-initialized global workers
+        logger.info("Using initialized global workers (HF-style)")
         self.rmbg_worker = rmbg_worker
         self.i23d_worker = i23d_worker
         self.tex_pipeline = tex_pipeline
@@ -184,7 +203,7 @@ class Predictor(BasePredictor):
         # Initial GPU memory cleanup
         self._cleanup_gpu_memory()
         
-        logger.info("Setup completed using HF-style module-level workers")
+        logger.info("Setup completed using HF-style lazy-loaded workers")
     
     def cleanup_gpu_memory(self):
         """Clean up GPU memory between predictions"""
@@ -284,6 +303,11 @@ class Predictor(BasePredictor):
             # Memory safety check
             if not self._check_memory_safety():
                 raise RuntimeError(f"Insufficient VRAM available ({self.vram_monitor.get_available_vram():.1f}GB)")
+
+            # Ensure models are initialized (safety check)
+            if rmbg_worker is None:
+                logger.info("Models not initialized, initializing now...")
+                initialize_models()
 
             # Load and preprocess image
             if isinstance(image_input, Path):
