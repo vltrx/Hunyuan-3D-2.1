@@ -156,6 +156,18 @@ class Predictor(BasePredictor):
             conf.realesrgan_ckpt_path = "hy3dpaint/ckpt/RealESRGAN_x4plus.pth"
             conf.multiview_cfg_path = "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
             conf.custom_pipeline = "hy3dpaint/hunyuanpaintpbr"
+            
+            # Fallback: Download RealESRGAN model if missing
+            if not os.path.exists(conf.realesrgan_ckpt_path):
+                logger.warning("RealESRGAN model not found, downloading as fallback...")
+                os.makedirs(os.path.dirname(conf.realesrgan_ckpt_path), exist_ok=True)
+                subprocess.run([
+                    "wget", 
+                    "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
+                    "-O", conf.realesrgan_ckpt_path
+                ], check=True)
+                logger.info("RealESRGAN model downloaded successfully")
+            
             self.tex_pipeline = Hunyuan3DPaintPipeline(conf)
             logger.info("Texture generation model loaded successfully")
         except Exception as e:
