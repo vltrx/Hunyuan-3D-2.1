@@ -639,7 +639,28 @@ class Predictor(BasePredictor):
                 # Texture-only mode
                 self._log_analytics_event("predict_mode", {"mode": "paint_only"})
                 mesh_obj = load_trimesh(str(kwargs['mesh']), force="mesh")
-                mesh_obj = self.mesh_simplifier(mesh_obj)
+                
+                # Validate loaded mesh
+                if mesh_obj is None:
+                    raise ValueError("Failed to load mesh from file")
+                if not hasattr(mesh_obj, 'vertices') or len(mesh_obj.vertices) == 0:
+                    raise ValueError("Loaded mesh has no vertices")
+                if not hasattr(mesh_obj, 'faces') or len(mesh_obj.faces) == 0:
+                    raise ValueError("Loaded mesh has no faces")
+                
+                logger.info(f"Loaded mesh: {len(mesh_obj.vertices)} vertices, {len(mesh_obj.faces)} faces")
+                
+                # Try mesh simplification with graceful fallback
+                try:
+                    simplified_mesh = self.mesh_simplifier(mesh_obj)
+                    if simplified_mesh is not None and len(simplified_mesh.vertices) > 0 and len(simplified_mesh.faces) > 0:
+                        mesh_obj = simplified_mesh
+                        logger.info("Mesh simplification successful")
+                    else:
+                        logger.warning("Mesh simplification returned empty mesh, using original")
+                except Exception as e:
+                    logger.warning(f"Mesh simplification failed: {e}, using original mesh")
+                
                 mesh_obj = self.face_reduce_worker(mesh_obj, max_facenum=kwargs['max_facenum'])
                 self._cleanup_gpu_memory()
 
