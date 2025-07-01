@@ -404,13 +404,23 @@ class Predictor(BasePredictor):
         
         return outputs
 
-    def _check_memory_safety(self, min_required_gb: float = 30.0) -> bool:
+    def _check_memory_safety(self, min_required_gb: float = 12.0) -> bool:
         """Check if we have enough memory to proceed safely"""
         available = self.vram_monitor.get_available_vram()
         if available < min_required_gb:
             logger.warning(f"Low VRAM warning: {available:.1f}GB available, {min_required_gb}GB required")
             self._cleanup_gpu_memory()
             available = self.vram_monitor.get_available_vram()
+            
+            # More aggressive cleanup if still low
+            if available < min_required_gb:
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.ipc_collect()
+                available = self.vram_monitor.get_available_vram()
+                
             return available >= min_required_gb
         return True
 
@@ -757,14 +767,20 @@ class Predictor(BasePredictor):
         for idx, image_path in enumerate(image_paths):
             logger.info(f"\n📸 Processing image {idx + 1}/{len(image_paths)}: {os.path.basename(image_path)}")
             
-            # Pre-processing safety check
+            # Pre-processing safety check with better logging
+            current_vram = self.vram_monitor.get_available_vram()
+            logger.info(f"  VRAM before image {idx + 1}: {current_vram:.1f}GB available")
+            
             if not self._check_memory_safety():
                 logger.error(f"Insufficient VRAM for image {idx + 1}, skipping remaining images")
+                logger.info(f"  Consider processing images in smaller batches or using a GPU with more VRAM")
+                
                 # Add error entries for remaining images
                 for remaining_idx in range(idx, len(image_paths)):
                     remaining_path = image_paths[remaining_idx]
+                    image_name = os.path.splitext(os.path.basename(remaining_path))[0]
                     error_metadata = {
-                        "input_image": os.path.basename(remaining_path),
+                        "input_image": image_name,
                         "output_mesh": None,
                         "status": "error",
                         "duration": 0.0,
