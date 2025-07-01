@@ -434,7 +434,11 @@ class Predictor(BasePredictor):
         Returns metadata dict for the image
         """
         start_time = time.time()
-        image_name = f"image{image_idx + 1}" if isinstance(image_input, str) else os.path.splitext(os.path.basename(image_input))[0]
+        # CRITICAL: Always preserve original filename (without extension) for output mesh
+        if isinstance(image_input, str):
+            image_name = os.path.splitext(os.path.basename(image_input))[0]
+        else:
+            image_name = os.path.splitext(os.path.basename(str(image_input)))[0]
         
         metadata = {
             "input_image": image_name,
