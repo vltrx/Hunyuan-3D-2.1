@@ -7,6 +7,7 @@ import json
 import traceback
 import io
 import requests
+import zipfile
 from typing import List, Optional, Union
 import gc
 import numpy as np
@@ -24,11 +25,17 @@ def setup_environment():
     os.environ["LD_LIBRARY_PATH"] = f"{os.environ.get('CUDA_HOME', '/usr/local/cuda')}/lib64:{os.environ.get('LD_LIBRARY_PATH', '')}"
     os.environ["TORCH_CUDA_ARCH_LIST"] = "8.0;8.6"
     
+    # Critical environment variables for production stability
+    os.environ["OMP_NUM_THREADS"] = "1"
+    # U2NET_HOME will be set later when U2NET_PATH is defined
+    
     # Ensure CUDA toolkit is available
     print(f"CUDA_HOME: {os.environ.get('CUDA_HOME')}")
     print(f"PATH: {os.environ.get('PATH')}")
     print(f"LD_LIBRARY_PATH: {os.environ.get('LD_LIBRARY_PATH')}")
     print(f"TORCH_CUDA_ARCH_LIST: {os.environ.get('TORCH_CUDA_ARCH_LIST')}")
+    print(f"OMP_NUM_THREADS: {os.environ.get('OMP_NUM_THREADS')}")
+    print(f"U2NET_HOME: {os.environ.get('U2NET_HOME')}")
 
 # Setup environment before importing anything else
 setup_environment()
@@ -71,56 +78,15 @@ degenerate_face_remove_worker = None
 face_reduce_worker = None
 mesh_simplifier = None
 
-def initialize_models():
-    """Initialize models lazily (HF-style but on-demand)"""
-    global rmbg_worker, i23d_worker, tex_pipeline
-    global floater_remove_worker, degenerate_face_remove_worker, face_reduce_worker, mesh_simplifier
-    
-    if rmbg_worker is not None:
-        return  # Already initialized
-    
-    print("Initializing models at runtime (HF-style)...")
+# Model loading state tracking
+_models_loading_state = {
+    'rembg': False,
+    'shape': False,
+    'texture': False,
+    'postprocessing': False
+}
 
-    # Initialize background removal worker
-    print("Loading background removal model...")
-    rmbg_worker = BackgroundRemover()
-
-    # Initialize shape generation model  
-    print("Loading shape generation model...")
-    i23d_worker = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
-        "tencent/Hunyuan3D-2.1"
-    )
-
-    # Initialize texture generation model
-    print("Loading texture generation model...")
-    max_num_view = 6
-    resolution = 512
-    tex_conf = Hunyuan3DPaintConfig(max_num_view, resolution)
-    tex_conf.realesrgan_ckpt_path = "hy3dpaint/ckpt/RealESRGAN_x4plus.pth"
-    tex_conf.multiview_cfg_path = "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
-    tex_conf.custom_pipeline = "hy3dpaint/hunyuanpaintpbr"
-
-    # Fallback: Download RealESRGAN model if missing
-    if not os.path.exists(tex_conf.realesrgan_ckpt_path):
-        print("RealESRGAN model not found, downloading as fallback...")
-        os.makedirs(os.path.dirname(tex_conf.realesrgan_ckpt_path), exist_ok=True)
-        subprocess.run([
-            "wget", 
-            "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
-            "-O", tex_conf.realesrgan_ckpt_path
-        ], check=True)
-        print("RealESRGAN model downloaded successfully")
-
-    tex_pipeline = Hunyuan3DPaintPipeline(tex_conf)
-
-    # Initialize mesh processing workers
-    print("Loading mesh processing tools...")
-    floater_remove_worker = FloaterRemover()
-    degenerate_face_remove_worker = DegenerateFaceRemover()
-    face_reduce_worker = FaceReducer()
-    mesh_simplifier = MeshSimplifier()
-
-    print("All models initialized successfully (HF-style)")
+# Legacy initialize_models function replaced with lazy loading methods above
 
 # Constants
 CHECKPOINTS_PATH = "/src/checkpoints"
@@ -128,6 +94,9 @@ HUNYUAN3D_MODEL_PATH = "tencent/Hunyuan3D-2.1"
 U2NET_PATH = os.path.join(CHECKPOINTS_PATH, ".u2net/")
 U2NET_URL = "https://weights.replicate.delivery/default/comfy-ui/rembg/u2net.onnx.tar"
 REALESRGAN_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"
+
+# Set U2NET_HOME now that U2NET_PATH is defined
+os.environ["U2NET_HOME"] = U2NET_PATH
 
 def download_if_not_exists(url, dest):
     if not os.path.exists(dest):
@@ -149,14 +118,176 @@ def download_file_if_not_exists(url, dest_path):
         duration = time.time() - start
         logger.info(f"downloading took: {duration:.2f}s")
 
+# Lazy Loading Architecture - Critical for Replicate cold start performance
+def _ensure_rembg_loaded():
+    """Ensure background removal model is loaded"""
+    global rmbg_worker, _models_loading_state
+    if rmbg_worker is None and not _models_loading_state['rembg']:
+        _models_loading_state['rembg'] = True
+        logger.info("Loading background removal model on-demand...")
+        rmbg_worker = BackgroundRemover()
+        logger.info("Background removal model loaded")
+    return rmbg_worker
+
+def _ensure_shape_model_loaded():
+    """Ensure shape generation model is loaded"""
+    global i23d_worker, _models_loading_state
+    if i23d_worker is None and not _models_loading_state['shape']:
+        _models_loading_state['shape'] = True
+        logger.info("Loading shape generation model on-demand...")
+        i23d_worker = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
+            "tencent/Hunyuan3D-2.1"
+        )
+        logger.info("Shape generation model loaded")
+    return i23d_worker
+
+def _ensure_texture_model_loaded():
+    """Ensure texture generation model is loaded"""
+    global tex_pipeline, _models_loading_state
+    if tex_pipeline is None and not _models_loading_state['texture']:
+        _models_loading_state['texture'] = True
+        logger.info("Loading texture generation model on-demand...")
+        max_num_view = 6
+        resolution = 512
+        tex_conf = Hunyuan3DPaintConfig(max_num_view, resolution)
+        tex_conf.realesrgan_ckpt_path = "hy3dpaint/ckpt/RealESRGAN_x4plus.pth"
+        tex_conf.multiview_cfg_path = "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
+        tex_conf.custom_pipeline = "hy3dpaint/hunyuanpaintpbr"
+
+        # Fallback: Download RealESRGAN model if missing
+        if not os.path.exists(tex_conf.realesrgan_ckpt_path):
+            logger.info("RealESRGAN model not found, downloading...")
+            os.makedirs(os.path.dirname(tex_conf.realesrgan_ckpt_path), exist_ok=True)
+            subprocess.run([
+                "wget", 
+                "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
+                "-O", tex_conf.realesrgan_ckpt_path
+            ], check=True)
+
+        tex_pipeline = Hunyuan3DPaintPipeline(tex_conf)
+        logger.info("Texture generation model loaded")
+    return tex_pipeline
+
+def _ensure_postprocessing_loaded():
+    """Ensure mesh post-processing workers are loaded"""
+    global floater_remove_worker, degenerate_face_remove_worker, face_reduce_worker, mesh_simplifier, _models_loading_state
+    if floater_remove_worker is None and not _models_loading_state['postprocessing']:
+        _models_loading_state['postprocessing'] = True
+        logger.info("Loading mesh processing tools on-demand...")
+        floater_remove_worker = FloaterRemover()
+        degenerate_face_remove_worker = DegenerateFaceRemover()
+        face_reduce_worker = FaceReducer()
+        mesh_simplifier = MeshSimplifier()
+        logger.info("Mesh processing tools loaded")
+    return floater_remove_worker, degenerate_face_remove_worker, face_reduce_worker, mesh_simplifier
+
+def validate_zip_file(zip_path: Path) -> bool:
+    """Validate ZIP file integrity"""
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            # Test ZIP file integrity
+            bad_file = zip_ref.testzip()
+            if bad_file:
+                logger.error(f"Corrupted file in ZIP: {bad_file}")
+                return False
+            
+            # Check if ZIP contains any valid image files
+            image_extensions = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.webp'}
+            has_images = any(
+                os.path.splitext(file_info.filename.lower())[1] in image_extensions
+                for file_info in zip_ref.filelist
+                if not file_info.is_dir()
+            )
+            
+            if not has_images:
+                logger.error("ZIP file contains no valid image files")
+                return False
+                
+            return True
+    except zipfile.BadZipFile:
+        logger.error("Invalid ZIP file format")
+        return False
+    except Exception as e:
+        logger.error(f"ZIP validation error: {str(e)}")
+        return False
+
+def validate_image_file(image_path: str) -> bool:
+    """Validate individual image file"""
+    try:
+        with Image.open(image_path) as img:
+            img.verify()  # Verify image integrity
+            
+            # Re-open for format check (verify() closes the file)
+            with Image.open(image_path) as img:
+                # Check minimum dimensions
+                if img.width < 32 or img.height < 32:
+                    logger.warning(f"Image too small: {img.width}x{img.height}")
+                    return False
+                
+                # Check maximum dimensions to prevent memory issues
+                if img.width > 4096 or img.height > 4096:
+                    logger.warning(f"Image too large: {img.width}x{img.height}")
+                    return False
+                    
+                return True
+    except Exception as e:
+        logger.error(f"Image validation failed for {image_path}: {str(e)}")
+        return False
+
 class Output(BaseModel):
-    # Single mode outputs
-    mesh: Optional[Path] = None
+    mesh: Path
+    batch_results: Path = None  # For batch processing results
+
+def extract_zip_images(zip_path: Path, extract_dir: str) -> List[str]:
+    """Extract images from ZIP file and return list of valid image paths"""
+    # Validate ZIP file first
+    if not validate_zip_file(zip_path):
+        raise ValueError("Invalid or corrupted ZIP file")
     
-    # Batch mode outputs (when batch_mode=True)
-    meshes: Optional[List[Path]] = None
-    failed_images: Optional[List[str]] = None
-    processing_stats: Optional[dict] = None
+    image_extensions = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.webp'}
+    image_paths = []
+    
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        for file_info in zip_ref.filelist:
+            if not file_info.is_dir():
+                file_ext = os.path.splitext(file_info.filename.lower())[1]
+                if file_ext in image_extensions:
+                    try:
+                        # Extract the file
+                        zip_ref.extract(file_info, extract_dir)
+                        extracted_path = os.path.join(extract_dir, file_info.filename)
+                        
+                        # Validate extracted image
+                        if validate_image_file(extracted_path):
+                            image_paths.append(extracted_path)
+                        else:
+                            logger.warning(f"Skipping invalid image: {file_info.filename}")
+                            # Clean up invalid file
+                            try:
+                                os.remove(extracted_path)
+                            except:
+                                pass
+                    except Exception as e:
+                        logger.warning(f"Failed to extract {file_info.filename}: {str(e)}")
+                        continue
+    
+    if len(image_paths) == 0:
+        raise ValueError("No valid images found in ZIP file after validation")
+    
+    return sorted(image_paths)
+
+def create_batch_zip(meshes_dir: str, results_json_path: str, output_zip_path: str):
+    """Create ZIP file containing all batch results"""
+    with zipfile.ZipFile(output_zip_path, 'w', zipfile.ZIP_DEFLATED) as zip_ref:
+        # Add results JSON
+        zip_ref.write(results_json_path, 'batch_results.json')
+        
+        # Add all mesh files
+        if os.path.exists(meshes_dir):
+            for filename in os.listdir(meshes_dir):
+                if filename.endswith('.glb'):
+                    file_path = os.path.join(meshes_dir, filename)
+                    zip_ref.write(file_path, f'meshes/{filename}')
 
 class VRAMMonitor:
     """Monitor VRAM usage for batch processing safety"""
@@ -180,22 +311,9 @@ class VRAMMonitor:
 
 class Predictor(BasePredictor):
     def setup(self) -> None:
-        """Load the model into memory to make running multiple predictions efficient"""
+        """Fast setup for Replicate - models loaded on-demand for optimal cold start"""
         
-        logger.info("Setup started")
-        
-        # Lazy model initialization (HF-style but on-demand)
-        initialize_models()
-        
-        # Use the now-initialized global workers
-        logger.info("Using initialized global workers (HF-style)")
-        self.rmbg_worker = rmbg_worker
-        self.i23d_worker = i23d_worker
-        self.tex_pipeline = tex_pipeline
-        self.floater_remove_worker = floater_remove_worker
-        self.degenerate_face_remove_worker = degenerate_face_remove_worker
-        self.face_reduce_worker = face_reduce_worker
-        self.mesh_simplifier = mesh_simplifier
+        logger.info("Setup started - using lazy loading for optimal performance")
         
         # Initialize VRAM monitor
         self.vram_monitor = VRAMMonitor()
@@ -203,7 +321,10 @@ class Predictor(BasePredictor):
         # Initial GPU memory cleanup
         self._cleanup_gpu_memory()
         
-        logger.info("Setup completed using HF-style lazy-loaded workers")
+        # Download critical dependencies if needed (non-blocking for models)
+        download_if_not_exists(U2NET_URL, U2NET_PATH)
+        
+        logger.info("Setup completed - models will load on-demand")
     
     def _cleanup_gpu_memory(self):
         """Clean up GPU memory between predictions"""
@@ -213,18 +334,21 @@ class Predictor(BasePredictor):
             gc.collect()
             
     # HF-style shape generation function (mimicking their exact pattern)
-    def _hf_style_gen_shape(self, image, steps=50, guidance_scale=5.0, seed=1234, 
-                           octree_resolution=512, num_chunks=8000):
-        """Generate shape using HF Space pattern with module-level workers"""
+    def _hf_style_gen_shape(self, image, steps=50, guidance_scale=5.5, seed=1234, 
+                           octree_resolution=512, num_chunks=200000):
+        """Generate shape using HF Space pattern with lazy-loaded model"""
         
         logger.info(f"HF-style shape generation: steps={steps}, guidance_scale={guidance_scale}")
         
-        # Use module-level worker directly (HF pattern)
+        # Ensure shape model is loaded
+        shape_worker = _ensure_shape_model_loaded()
+        
+        # Use lazy-loaded worker (HF pattern)
         generator = torch.Generator()
         generator = generator.manual_seed(int(seed))
         
-        # Direct call to module-level worker (exactly like HF Space)
-        outputs = i23d_worker(
+        # Direct call to lazy-loaded worker (exactly like HF Space)
+        outputs = shape_worker(
             image=image,
             num_inference_steps=steps,
             guidance_scale=guidance_scale,
@@ -291,196 +415,100 @@ class Predictor(BasePredictor):
         return True
 
     def _log_analytics_event(self, event_name, params=None):
-        # In production, you might want to log to analytics service
-        logger.info(f"Analytics: {event_name} - {params}")
+        """Analytics stub - safe to call even if analytics service unavailable"""
+        try:
+            # In production, you might want to log to analytics service
+            logger.info(f"Analytics: {event_name} - {params}")
+        except Exception as e:
+            # Never let analytics logging break the main pipeline
+            logger.debug(f"Analytics logging failed: {e}")
+            pass
 
     def _process_single_image(self, 
-                            image_input: Union[Path, Image.Image], 
+                            image_input: Union[Path, str], 
                             output_dir: str,
                             image_idx: int,
-                            **kwargs) -> Optional[Path]:
+                            **kwargs) -> dict:
         """
         Process a single image with comprehensive error handling
+        Returns metadata dict for the image
         """
         start_time = time.time()
+        image_name = f"image{image_idx + 1}" if isinstance(image_input, str) else os.path.splitext(os.path.basename(image_input))[0]
+        
+        metadata = {
+            "input_image": image_name,
+            "output_mesh": f"{image_name}.glb",
+            "status": "error",
+            "duration": 0.0,
+            "face_count": 0,
+            "vertex_count": 0,
+            "error": None,
+            "error_type": None
+        }
         
         try:
             # Memory safety check
             if not self._check_memory_safety():
                 raise RuntimeError(f"Insufficient VRAM available ({self.vram_monitor.get_available_vram():.1f}GB)")
 
-            # Ensure models are initialized (safety check)
-            if rmbg_worker is None:
-                logger.info("Models not initialized, initializing now...")
-                initialize_models()
-
-            # Load and preprocess image
-            if isinstance(image_input, Path):
+            # Load and preprocess image with validation
+            if isinstance(image_input, str):
+                if not validate_image_file(image_input):
+                    raise ValueError(f"Invalid image file: {image_input}")
+                input_image = Image.open(image_input).convert("RGB")
+            else:
                 input_image = Image.open(str(image_input)).convert("RGB")
-                image_name = os.path.splitext(os.path.basename(image_input))[0]
-            else:
-                input_image = image_input
-                image_name = f"image_{image_idx}"
 
-            # Background removal
-            logger.info(f"  Removing background for {image_name}")
-            processed_image = rmbg_worker(input_image)  # Use module-level worker directly
-            
-            # Log transparency info
-            if hasattr(processed_image, 'getchannel'):
-                alpha = processed_image.getchannel('A')
-                alpha_array = np.array(alpha)
-                opaque_pixels = np.sum(alpha_array > 0)
-                total_pixels = alpha_array.size
-                transparency_ratio = opaque_pixels / total_pixels
-                logger.info(f"  Image transparency: {transparency_ratio*100:.2f}% opaque pixels")
-                
-                # IMMEDIATE DEBUG: Test if we can reach this line
-                logger.info("  DEBUG: Line immediately after transparency logging reached")
-                
-                # IMMEDIATE DEBUG: Test variable cleanup
-                del alpha, alpha_array, opaque_pixels, total_pixels, transparency_ratio
-                logger.info("  DEBUG: Variables cleaned up successfully")
-                
-                # Force garbage collection to prevent memory issues
-                import gc
-                gc.collect()
-                logger.info("  DEBUG: Garbage collection completed")
-                
-                # Clear any potential GPU memory issues
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    logger.info("  DEBUG: CUDA cache cleared")
+            # Background removal with lazy loading
+            if kwargs.get('remove_background', True):
+                logger.info(f"  Removing background for {image_name}")
+                rmbg = _ensure_rembg_loaded()
+                processed_image = rmbg(input_image)
             else:
-                logger.info("  DEBUG: No alpha channel found, skipping transparency check")
+                processed_image = input_image
             
-            # IMMEDIATE DEBUG: Test if we can reach shape generation section
-            logger.info("  DEBUG: About to start shape generation section")
+            # Shape generation with lazy loading
+            logger.info(f"  Starting shape generation for {image_name}")
+            shape_model = _ensure_shape_model_loaded()
             
-            # DEBUG: Add checkpoint logs to identify where process hangs
-            logger.info("  DEBUG: About to start shape generation timing")
-            
-            # Start timing shape generation
-            shape_start_time = time.time()
-            logger.info(f"  Beginning shape generation at {time.strftime('%H:%M:%S')}")
-            
-            # DEBUG: Log before calling HF-style generation
-            logger.info("  DEBUG: About to call HF-style shape generation")
-            
-            # Use HF-style shape generation (exactly like HF Space)
             outputs = self._hf_style_gen_shape(
                 processed_image, 
                 kwargs.get('steps', 50),
-                kwargs.get('guidance_scale', 5.0), 
-                kwargs.get('seed', 1234) + image_idx,
+                kwargs.get('guidance_scale', 5.5), 
+                kwargs.get('seed', 1234) + image_idx,  # Incremental seed
                 kwargs.get('octree_resolution', 512),
-                kwargs.get('num_chunks', 8000)
+                kwargs.get('num_chunks', 200000)
             )
             
-            # DEBUG: Log after HF-style generation returns
-            logger.info("  DEBUG: HF-style shape generation returned")
-            
-            shape_total_time = time.time() - shape_start_time
-            logger.info(f"  Total shape pipeline time: {shape_total_time:.1f} seconds")
-            
-            # Clean up GPU memory after generation (HF-style)
+            # Clean up GPU memory after generation
             self._cleanup_gpu_memory()
             
             # Check if mesh generation was successful
-            if outputs is None:
-                raise RuntimeError("Mesh generation returned None - surface extraction failed")
+            if outputs is None or len(outputs) == 0:
+                raise RuntimeError("Shape generation failed - no mesh output")
             
-            # Add detailed mesh diagnostics
-            logger.info(f"  Generated mesh - Vertices: {len(outputs[0].vertices)}, Faces: {len(outputs[0].faces)}")
-            if hasattr(outputs[0], 'bounds'):
-                bounds = outputs[0].bounds
-                size = bounds[1] - bounds[0]
-                logger.info(f"  Mesh bounds: {bounds}, Size: {size}")
-                logger.info(f"  Mesh volume: {outputs[0].volume:.6f}")
-                
-                # Check if mesh is degenerate (very flat) and retry if needed
-                min_dimension = min(size)
-                max_dimension = max(size)
-                dimension_ratio = min_dimension / max_dimension if max_dimension > 0 else 0
-                
-                # More sensitive detection for flat geometry
-                is_flat = (
-                    min_dimension < 0.1 or  # Increased threshold
-                    outputs[0].volume < 0.01 or  # Increased threshold  
-                    dimension_ratio < 0.15  # New: detect when one dimension is much smaller
-                )
-                
-                if is_flat:
-                    logger.warning(f"  ⚠️  Detected flat mesh - min dimension: {min_dimension:.6f}, volume: {outputs[0].volume:.6f}, ratio: {dimension_ratio:.3f}")
-                    logger.info(f"  🔄 Retrying with enhanced parameters...")
-                    
-                    # Retry with parameters that help generate more 3D geometry
-                    try:
-                        retry_outputs = self._hf_style_gen_shape(
-                            processed_image,
-                            min(kwargs.get('steps', 50) + 10, 60),  # More steps
-                            min(kwargs.get('guidance_scale', 5.0) + 3.0, 12.0),  # Much higher guidance
-                            kwargs.get('seed', 1234) + image_idx + 999,  # Different seed
-                            min(kwargs.get('octree_resolution', 512) + 128, 640),  # Higher resolution
-                            max(kwargs.get('num_chunks', 8000) - 2000, 6000)  # Fewer chunks for more detail
-                        )
-                        retry_mesh = retry_outputs[0]
-                        
-                        if retry_mesh is not None and hasattr(retry_mesh, 'bounds'):
-                            retry_bounds = retry_mesh.bounds
-                            retry_size = retry_bounds[1] - retry_bounds[0]
-                            retry_min_dim = min(retry_size)
-                            retry_max_dim = max(retry_size)
-                            retry_ratio = retry_min_dim / retry_max_dim if retry_max_dim > 0 else 0
-                            retry_volume = retry_mesh.volume
-                            
-                            # Check if retry improved the geometry (focus on dimension ratio and volume)
-                            improved_ratio = retry_ratio > dimension_ratio * 1.5  # At least 50% better ratio
-                            improved_volume = retry_volume > outputs[0].volume * 2.0  # At least 2x volume
-                            improved_min_dim = retry_min_dim > min_dimension * 1.5  # At least 50% thicker
-                            
-                            if improved_ratio or improved_volume or improved_min_dim:
-                                logger.info(f"  ✅ Retry improved geometry - ratio: {retry_ratio:.3f} (was {dimension_ratio:.3f}), volume: {retry_volume:.6f} (was {outputs[0].volume:.6f})")
-                                outputs[0] = retry_mesh
-                            else:
-                                logger.info(f"  ⚠️  Retry didn't improve significantly - ratio: {retry_ratio:.3f}, volume: {retry_volume:.6f}, keeping original")
-                        else:
-                            logger.info(f"  ⚠️  Retry failed, keeping original mesh")
-                            
-                    except Exception as retry_error:
-                        logger.warning(f"  ⚠️  Retry failed with error: {str(retry_error)}, keeping original")
-                
-            else:
-                logger.info("  Mesh bounds info not available")
+            mesh = outputs[0]
+            if mesh is None or not hasattr(mesh, 'vertices') or len(mesh.vertices) == 0:
+                raise RuntimeError("Shape generation failed - empty mesh")
             
-            # Post-process mesh
+            logger.info(f"  Generated mesh - Vertices: {len(mesh.vertices)}, Faces: {len(mesh.faces)}")
+            
+            # Post-process mesh with lazy loading
             logger.info(f"  Post-processing mesh for {image_name}")
+            floater_remover, degenerate_remover, face_reducer, mesh_simplifier = _ensure_postprocessing_loaded()
             
-            # Basic cleanup using module-level workers (HF pattern)
-            mesh_output = floater_remove_worker(outputs[0])
+            # Apply post-processing pipeline
+            mesh_output = floater_remover(mesh)
             if mesh_output is None or len(mesh_output.vertices) == 0 or len(mesh_output.faces) == 0:
                 raise RuntimeError("Mesh became empty after floater removal")
                 
-            mesh_output = degenerate_face_remove_worker(mesh_output)
+            mesh_output = degenerate_remover(mesh_output)
             if mesh_output is None or len(mesh_output.vertices) == 0 or len(mesh_output.faces) == 0:
                 raise RuntimeError("Mesh became empty after degenerate face removal")
             
-            # Optional mesh simplification (skip if binary missing)
-            mesh_before_simplify = mesh_output
-            try:
-                simplified_mesh = mesh_simplifier(mesh_output)
-                if simplified_mesh is None or len(simplified_mesh.vertices) == 0 or len(simplified_mesh.faces) == 0:
-                    logger.warning("  Mesh simplifier returned empty mesh, skipping simplification")
-                    mesh_output = mesh_before_simplify  # Keep original mesh
-                else:
-                    logger.info(f"  Mesh simplified successfully")
-                    mesh_output = simplified_mesh
-            except Exception as e:
-                logger.warning(f"  Mesh simplification failed ({str(e)}), continuing without simplification")
-                mesh_output = mesh_before_simplify  # Keep original mesh
-            
             # Face reduction (always needed)
-            mesh_output = face_reduce_worker(mesh_output, max_facenum=kwargs.get('max_facenum', 40000))
+            mesh_output = face_reducer(mesh_output, max_facenum=kwargs.get('max_facenum', 40000))
             if mesh_output is None or len(mesh_output.vertices) == 0 or len(mesh_output.faces) == 0:
                 raise RuntimeError("Mesh became empty after face reduction")
                 
@@ -490,8 +518,9 @@ class Predictor(BasePredictor):
             temp_mesh_path = os.path.join(output_dir, f"{image_name}_temp.obj")
             mesh_output.export(temp_mesh_path)
 
-            # Apply texturing using module-level worker (HF pattern)
+            # Apply texturing with lazy loading
             logger.info(f"  Generating texture for {image_name}")
+            tex_pipeline = _ensure_texture_model_loaded()
             textured_mesh_path = tex_pipeline(
                 mesh_path=temp_mesh_path,
                 image_path=input_image,
@@ -501,8 +530,18 @@ class Predictor(BasePredictor):
             # Export final GLB
             from trimesh import load as load_trimesh
             final_mesh = load_trimesh(textured_mesh_path)
-            output_path = Path(os.path.join(output_dir, f"{image_name}.glb"))
-            final_mesh.export(str(output_path), include_normals=True)
+            output_path = os.path.join(output_dir, f"{image_name}.glb")
+            final_mesh.export(output_path, include_normals=True)
+
+            # Update metadata with success
+            metadata.update({
+                "status": "success",
+                "duration": time.time() - start_time,
+                "face_count": len(final_mesh.faces),
+                "vertex_count": len(final_mesh.vertices),
+                "error": None,
+                "error_type": None
+            })
 
             # Cleanup intermediate files
             try:
@@ -512,92 +551,51 @@ class Predictor(BasePredictor):
             except:
                 pass  # Don't fail if cleanup fails
 
-            processing_time = time.time() - start_time
-            logger.info(f"  ✅ {image_name} completed in {processing_time:.1f}s, faces: {len(final_mesh.faces)}")
+            logger.info(f"  ✅ {image_name} completed in {metadata['duration']:.1f}s, faces: {metadata['face_count']}")
             
-            return output_path
+            return metadata
 
         except Exception as e:
-            error_msg = f"Failed to process image {image_idx}: {str(e)}"
-            logger.error(error_msg)
+            error_msg = str(e)
+            error_type = type(e).__name__
+            
+            metadata.update({
+                "status": "error",
+                "duration": time.time() - start_time,
+                "error": error_msg,
+                "error_type": error_type
+            })
+            
+            logger.error(f"Failed to process {image_name}: {error_msg}")
             logger.error(traceback.format_exc())
-            return None
+            return metadata
         finally:
             self._cleanup_gpu_memory()
 
     def predict(
         self,
-        image: Path = Input(
-            description="Input image for generating 3D shape (single mode)",
-            default=None,
-        ),
-        images: str = Input(
-            description="Comma-separated URLs or base64 images for batch processing",
-            default=None,
-        ),
-        mesh: Path = Input(
-            description="Optional: Upload a .glb mesh to skip generation and only texture it",
-            default=None,
-        ),
-        prompt: str = Input(
-            description="Text prompt to guide texture generation",
-            default="a detailed texture",
-        ),
-        steps: int = Input(
-            description="Number of inference steps",
-            default=50,
-            ge=20,
-            le=50,
-        ),
-        guidance_scale: float = Input(
-            description="Guidance scale for generation",
-            default=5.0,
-            ge=1.0,
-            le=20.0,
-        ),
-        max_facenum: int = Input(
-            description="Maximum number of faces for mesh generation",
-            default=40000,
-            ge=10000,
-            le=200000,
-        ),
-        num_chunks: int = Input(
-            description="Number of chunks for mesh generation",
-            default=8000,
-            ge=1000,
-            le=200000,
-        ),
-        seed: int = Input(
-            description="Random seed for generation",
-            default=1234,
-        ),
-        octree_resolution: int = Input(
-            description="Octree resolution for mesh generation",
-            choices=[256, 384, 512],
-            default=512,
-        ),
-        remove_background: bool = Input(
-            description="Whether to remove background from input image",
-            default=True,
-        ),
-        batch_mode: bool = Input(
-            description="Enable batch processing mode",
-            default=False,
-        ),
-        max_batch_size: int = Input(
-            description="Maximum number of images to process in batch mode",
-            default=10,
-            ge=1,
-            le=25,
-        ),
+        image: Path = Input(description="Input image for generating 3D shape (single image mode)", default=None),
+        batch_images: Path = Input(description="ZIP file containing multiple images for batch processing", default=None),
+        mesh: Path = Input(description="Optional: Upload a .glb mesh to skip generation and only texture it", default=None),
+        prompt: str = Input(description="Text prompt to guide texture generation", default="a detailed texture of a stone sculpture"),
+        steps: int = Input(description="Number of inference steps", default=50, ge=20, le=50),
+        guidance_scale: float = Input(description="Guidance scale for generation", default=5.5, ge=1.0, le=20.0),
+        max_facenum: int = Input(description="Maximum number of faces for mesh generation", default=40000, ge=10000, le=200000),
+        num_chunks: int = Input(description="Number of chunks for mesh generation", default=200000, ge=10000, le=200000),
+        seed: int = Input(description="Random seed for generation", default=1234),
+        octree_resolution: int = Input(description="Octree resolution for mesh generation", choices=[256, 384, 512], default=512),
+        remove_background: bool = Input(description="Whether to remove background from input image", default=True),
     ) -> Output:
         
         start_time = time.time()
+        
+        # Analytics
+        self._log_analytics_event("predict_started")
 
-        # Determine processing mode
-        if batch_mode and images:
+        # Determine processing mode based on inputs
+        if batch_images:
             return self._predict_batch(
-                images=images,
+                batch_images=batch_images,
                 steps=steps,
                 guidance_scale=guidance_scale,
                 max_facenum=max_facenum,
@@ -605,7 +603,6 @@ class Predictor(BasePredictor):
                 seed=seed,
                 octree_resolution=octree_resolution,
                 remove_background=remove_background,
-                max_batch_size=max_batch_size,
                 prompt=prompt
             )
         else:
@@ -623,20 +620,18 @@ class Predictor(BasePredictor):
             )
 
     def _predict_single(self, **kwargs) -> Output:
-        """Original single image processing logic"""
+        """Single image processing mode"""
         from trimesh import load as load_trimesh
 
-        self._log_analytics_event("predict_started", kwargs)
+        self._log_analytics_event("predict_mode", {"mode": "single"})
 
         if os.path.exists("output"):
             shutil.rmtree("output")
         os.makedirs("output", exist_ok=True)
 
-        generator = Generator().manual_seed(kwargs['seed'])
-
         try:
             if kwargs['mesh']:
-                # Texture-only mode
+                # Mesh-only texturing mode
                 self._log_analytics_event("predict_mode", {"mode": "paint_only"})
                 mesh_obj = load_trimesh(str(kwargs['mesh']), force="mesh")
                 
@@ -652,7 +647,8 @@ class Predictor(BasePredictor):
                 
                 # Try mesh simplification with graceful fallback
                 try:
-                    simplified_mesh = self.mesh_simplifier(mesh_obj)
+                    _, _, _, mesh_simplifier = _ensure_postprocessing_loaded()
+                    simplified_mesh = mesh_simplifier(mesh_obj)
                     if simplified_mesh is not None and len(simplified_mesh.vertices) > 0 and len(simplified_mesh.faces) > 0:
                         mesh_obj = simplified_mesh
                         logger.info("Mesh simplification successful")
@@ -661,13 +657,15 @@ class Predictor(BasePredictor):
                 except Exception as e:
                     logger.warning(f"Mesh simplification failed: {e}, using original mesh")
                 
-                mesh_obj = self.face_reduce_worker(mesh_obj, max_facenum=kwargs['max_facenum'])
+                _, _, face_reducer, _ = _ensure_postprocessing_loaded()
+                mesh_obj = face_reducer(mesh_obj, max_facenum=kwargs['max_facenum'])
                 self._cleanup_gpu_memory()
 
                 if kwargs['image'] is not None:
                     input_image = Image.open(str(kwargs['image'])).convert("RGB")
                     if kwargs['remove_background']:
-                        input_image = self.rmbg_worker(input_image)
+                        rmbg = _ensure_rembg_loaded()
+                        input_image = rmbg(input_image)
                         self._cleanup_gpu_memory()
                 else:
                     raise ValueError("To texture a mesh, an input image must be provided.")
@@ -675,7 +673,8 @@ class Predictor(BasePredictor):
                 temp_mesh_path = "output/temp_mesh.obj"
                 mesh_obj.export(temp_mesh_path)
 
-                textured_mesh_path = self.tex_pipeline(
+                tex_pipeline = _ensure_texture_model_loaded()
+                textured_mesh_path = tex_pipeline(
                     mesh_path=temp_mesh_path,
                     image_path=input_image,
                     output_mesh_path="output/textured_mesh.obj"
@@ -687,17 +686,22 @@ class Predictor(BasePredictor):
                 if kwargs['image'] is None:
                     raise ValueError("Image must be provided if mesh is not.")
 
-                result_path = self._process_single_image(
+                metadata = self._process_single_image(
                     kwargs['image'], 
                     "output", 
                     0, 
                     **kwargs
                 )
                 
-                if result_path is None:
-                    raise RuntimeError("Failed to process image")
+                if metadata['status'] != 'success':
+                    raise RuntimeError(f"Failed to process image: {metadata.get('error', 'Unknown error')}")
                 
-                return Output(mesh=result_path)
+                output_path = Path("output/mesh.glb")
+                if not output_path.exists():
+                    raise RuntimeError(f"Failed to generate mesh file at {output_path}")
+
+                self._log_analytics_event("predict_completed", {"duration": time.time() - time.time()})
+                return Output(mesh=output_path)
 
             output_path = Path("output/mesh.glb")
             final_mesh.export(str(output_path), include_normals=True)
@@ -705,132 +709,115 @@ class Predictor(BasePredictor):
             if not output_path.exists():
                 raise RuntimeError(f"Failed to generate mesh file at {output_path}")
 
+            self._log_analytics_event("predict_completed", {"duration": time.time() - time.time()})
             return Output(mesh=output_path)
 
         except Exception as e:
             self._log_analytics_event("predict_error", {"error": str(e)})
             raise
 
-    def _predict_batch(self, 
-                      images: str, 
-                      max_batch_size: int,
-                      **kwargs) -> Output:
+    def _predict_batch(self, batch_images: Path, **kwargs) -> Output:
         """
-        Sequential batch processing with robust error handling
+        Batch processing mode - extract ZIP, process images, create results
         """
         batch_start_time = time.time()
         
-        # Parse image inputs
-        if isinstance(images, str):
-            image_list = [img.strip() for img in images.split(',') if img.strip()]
-        else:
-            image_list = [images]
+        self._log_analytics_event("predict_mode", {"mode": "batch"})
         
-        # Validate and limit batch size
-        if len(image_list) > max_batch_size:
-            logger.warning(f"Batch size {len(image_list)} exceeds limit {max_batch_size}, truncating")
-            image_list = image_list[:max_batch_size]
-        
-        if len(image_list) == 0:
-            raise ValueError("No valid images provided for batch processing")
-
-        # Setup output directory
+        # Setup output directory structure
         if os.path.exists("output"):
             shutil.rmtree("output")
         os.makedirs("output", exist_ok=True)
+        os.makedirs("output/meshes", exist_ok=True)
         
-        logger.info(f"🚀 Starting batch processing: {len(image_list)} images")
+        # Extract images from ZIP
+        logger.info("Extracting images from ZIP file...")
+        extract_dir = "output/extracted"
+        os.makedirs(extract_dir, exist_ok=True)
+        
+        try:
+            image_paths = extract_zip_images(batch_images, extract_dir)
+            logger.info(f"Extracted {len(image_paths)} images from ZIP")
+        except Exception as e:
+            raise ValueError(f"Failed to extract ZIP file: {str(e)}")
+        
+        if len(image_paths) == 0:
+            raise ValueError("No valid images found in ZIP file")
+
+        logger.info(f"🚀 Starting batch processing: {len(image_paths)} images")
         logger.info(f"💾 Available VRAM: {self.vram_monitor.get_available_vram():.1f}GB")
         
-        self._log_analytics_event("batch_started", {
-            "num_images": len(image_list),
-            "max_batch_size": max_batch_size,
-            **kwargs
-        })
-
         # Process images sequentially
-        successful_meshes = []
-        failed_images = []
-        processing_times = []
+        batch_results = []
         
-        for idx, image_input in enumerate(image_list):
-            logger.info(f"\n📸 Processing image {idx + 1}/{len(image_list)}")
+        for idx, image_path in enumerate(image_paths):
+            logger.info(f"\n📸 Processing image {idx + 1}/{len(image_paths)}: {os.path.basename(image_path)}")
             
             # Pre-processing safety check
             if not self._check_memory_safety():
                 logger.error(f"Insufficient VRAM for image {idx + 1}, skipping remaining images")
-                failed_images.extend(image_list[idx:])
+                # Add error entries for remaining images
+                for remaining_idx in range(idx, len(image_paths)):
+                    remaining_path = image_paths[remaining_idx]
+                    error_metadata = {
+                        "input_image": os.path.basename(remaining_path),
+                        "output_mesh": None,
+                        "status": "error",
+                        "duration": 0.0,
+                        "face_count": 0,
+                        "vertex_count": 0,
+                        "error": "Insufficient VRAM",
+                        "error_type": "RuntimeError"
+                    }
+                    batch_results.append(error_metadata)
                 break
             
-            image_start_time = time.time()
+            # Process single image
+            metadata = self._process_single_image(
+                image_path,
+                "output/meshes",
+                idx,
+                **kwargs
+            )
             
-            try:
-                # Handle different input types (URL, file path, etc.)
-                if image_input.startswith(('http://', 'https://')):
-                    # Download image from URL
-                    response = requests.get(image_input)
-                    image_obj = Image.open(io.BytesIO(response.content))
-                else:
-                    # Assume it's a file path
-                    image_obj = Path(image_input)
-                
-                result_path = self._process_single_image(
-                    image_obj,
-                    "output",
-                    idx,
-                    **kwargs
-                )
-                
-                if result_path is not None:
-                    successful_meshes.append(result_path)
-                    processing_time = time.time() - image_start_time
-                    processing_times.append(processing_time)
-                    
-                    # Progress update
-                    avg_time = sum(processing_times) / len(processing_times)
-                    remaining = len(image_list) - idx - 1
-                    eta_minutes = (remaining * avg_time) / 60
-                    
-                    logger.info(f"✅ Image {idx + 1} completed in {processing_time:.1f}s")
-                    logger.info(f"📊 Progress: {len(successful_meshes)}/{len(image_list)} successful")
-                    if remaining > 0:
-                        logger.info(f"⏱️  ETA: {eta_minutes:.1f} minutes")
-                else:
-                    failed_images.append(image_input)
-                    logger.error(f"❌ Failed to process image {idx + 1}")
-                    
-            except Exception as e:
-                failed_images.append(image_input)
-                logger.error(f"❌ Error processing image {idx + 1}: {str(e)}")
-                continue
+            # Update output mesh path for successful results
+            if metadata['status'] == 'success':
+                metadata['output_mesh'] = f"{metadata['input_image']}.glb"
+            else:
+                metadata['output_mesh'] = None
+            
+            batch_results.append(metadata)
             
             # Cleanup between images
             self._cleanup_gpu_memory()
         
+        # Generate batch results JSON
+        results_json_path = "output/batch_results.json"
+        with open(results_json_path, 'w') as f:
+            json.dump(batch_results, f, indent=2)
+        
+        # Create batch ZIP file
+        batch_zip_path = "output/batch_meshes.zip"
+        create_batch_zip("output/meshes", results_json_path, batch_zip_path)
+        
         # Final statistics
         total_time = time.time() - batch_start_time
-        success_rate = len(successful_meshes) / len(image_list) * 100
-        avg_time_per_image = sum(processing_times) / len(processing_times) if processing_times else 0
-        
-        stats = {
-            "total_images": len(image_list),
-            "successful": len(successful_meshes),
-            "failed": len(failed_images),
-            "success_rate_percent": round(success_rate, 1),
-            "total_time_minutes": round(total_time / 60, 1),
-            "average_time_per_image_seconds": round(avg_time_per_image, 1),
-            "peak_vram_usage_gb": round(self.vram_monitor.get_used_vram(), 1)
-        }
+        successful_count = len([r for r in batch_results if r['status'] == 'success'])
+        success_rate = successful_count / len(image_paths) * 100
         
         logger.info(f"\n🏁 Batch processing completed!")
-        logger.info(f"📊 Results: {len(successful_meshes)}/{len(image_list)} successful ({success_rate:.1f}%)")
+        logger.info(f"📊 Results: {successful_count}/{len(image_paths)} successful ({success_rate:.1f}%)")
         logger.info(f"⏱️  Total time: {total_time/60:.1f} minutes")
-        logger.info(f"⚡ Average per image: {avg_time_per_image:.1f} seconds")
         
-        self._log_analytics_event("batch_completed", stats)
+        self._log_analytics_event("batch_predict_completed", {
+            "total_images": len(image_paths),
+            "successful": successful_count,
+            "failed": len(image_paths) - successful_count,
+            "success_rate_percent": round(success_rate, 1),
+            "total_time_minutes": round(total_time / 60, 1)
+        })
         
         return Output(
-            meshes=successful_meshes,
-            failed_images=failed_images,
-            processing_stats=stats
+            mesh=Path(batch_zip_path),
+            batch_results=Path(results_json_path)
         ) 
