@@ -84,6 +84,9 @@ mesh_simplifier = None
 worker_models = {}
 worker_models_lock = threading.Lock()
 
+# Post-processing serialization lock
+postprocessing_lock = threading.Lock()
+
 # Model loading state tracking
 _models_loading_state = {
     'rembg': False,
@@ -373,19 +376,19 @@ class VRAMMonitor:
     def get_available_vram(self) -> float:
         """Get available VRAM in GB (thread-safe)"""
         with self._lock:
-            if not cuda.is_available():
-                return 0.0
-            
-            total = cuda.get_device_properties(0).total_memory / 1024**3
-            allocated = cuda.memory_allocated(0) / 1024**3
-            return total - allocated
+        if not cuda.is_available():
+            return 0.0
+        
+        total = cuda.get_device_properties(0).total_memory / 1024**3
+        allocated = cuda.memory_allocated(0) / 1024**3
+        return total - allocated
     
     def get_used_vram(self) -> float:
         """Get used VRAM in GB (thread-safe)"""
         with self._lock:
-            if not cuda.is_available():
-                return 0.0
-            return cuda.memory_allocated(0) / 1024**3
+        if not cuda.is_available():
+            return 0.0
+        return cuda.memory_allocated(0) / 1024**3
     
     def check_parallel_safety(self, required_per_worker: float, num_workers: int) -> bool:
         """Check if we have enough VRAM for parallel workers"""
@@ -416,10 +419,10 @@ class Predictor(BasePredictor):
     def _cleanup_gpu_memory(self):
         """Thread-safe GPU memory cleanup"""
         with self._cleanup_lock:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()
-                gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+            gc.collect()
             
     # HF-style shape generation function (mimicking their exact pattern)
     def _hf_style_gen_shape(self, image, steps=50, guidance_scale=5.5, seed=1234, 
@@ -760,42 +763,46 @@ class Predictor(BasePredictor):
             
             logger.info(f"  [Worker-{thread_id}] Generated mesh - Vertices: {len(mesh.vertices)}, Faces: {len(mesh.faces)}")
             
-            # Post-process mesh with worker-specific models (no locking!)
-            logger.info(f"  [Worker-{thread_id}] Post-processing mesh for {image_name}")
-            
-            # Apply post-processing pipeline using worker models
-            mesh_output = worker_models_set['floater_remover'](mesh)
-            if mesh_output is None or len(mesh_output.vertices) == 0 or len(mesh_output.faces) == 0:
-                raise RuntimeError("Mesh became empty after floater removal")
+            # SERIALIZE post-processing to prevent memory overload
+            logger.info(f"  [Worker-{thread_id}] Waiting for post-processing slot...")
+            with postprocessing_lock:
+                logger.info(f"  [Worker-{thread_id}] Starting SERIALIZED post-processing for {image_name}")
                 
-            mesh_output = worker_models_set['degenerate_remover'](mesh_output)
-            if mesh_output is None or len(mesh_output.vertices) == 0 or len(mesh_output.faces) == 0:
-                raise RuntimeError("Mesh became empty after degenerate face removal")
-            
-            # Face reduction (always needed)
-            mesh_output = worker_models_set['face_reducer'](mesh_output, max_facenum=kwargs.get('max_facenum', 40000))
-            if mesh_output is None or len(mesh_output.vertices) == 0 or len(mesh_output.faces) == 0:
-                raise RuntimeError("Mesh became empty after face reduction")
+                # Apply post-processing pipeline using worker models (SERIALIZED)
+                mesh_output = worker_models_set['floater_remover'](mesh)
+                if mesh_output is None or len(mesh_output.vertices) == 0 or len(mesh_output.faces) == 0:
+                    raise RuntimeError("Mesh became empty after floater removal")
+                    
+                mesh_output = worker_models_set['degenerate_remover'](mesh_output)
+                if mesh_output is None or len(mesh_output.vertices) == 0 or len(mesh_output.faces) == 0:
+                    raise RuntimeError("Mesh became empty after degenerate face removal")
                 
-            self._cleanup_gpu_memory()
+                # Face reduction (always needed)
+                mesh_output = worker_models_set['face_reducer'](mesh_output, max_facenum=kwargs.get('max_facenum', 40000))
+                if mesh_output is None or len(mesh_output.vertices) == 0 or len(mesh_output.faces) == 0:
+                    raise RuntimeError("Mesh became empty after face reduction")
+                    
+                self._cleanup_gpu_memory()
 
-            # Save intermediate mesh
-            temp_mesh_path = os.path.join(output_dir, f"{image_name}_temp.obj")
-            mesh_output.export(temp_mesh_path)
+                # Save intermediate mesh
+                temp_mesh_path = os.path.join(output_dir, f"{image_name}_temp.obj")
+                mesh_output.export(temp_mesh_path)
 
-            # Apply texturing with worker-specific model (no locking!)
-            logger.info(f"  [Worker-{thread_id}] Generating texture for {image_name}")
-            textured_mesh_path = worker_models_set['texture'](
-                mesh_path=temp_mesh_path,
-                image_path=input_image,
-                output_mesh_path=os.path.join(output_dir, f"{image_name}_textured.obj")
-            )
+                # Apply texturing with worker-specific model (SERIALIZED)
+                logger.info(f"  [Worker-{thread_id}] Generating texture for {image_name}")
+                textured_mesh_path = worker_models_set['texture'](
+                    mesh_path=temp_mesh_path,
+                    image_path=input_image,
+                    output_mesh_path=os.path.join(output_dir, f"{image_name}_textured.obj")
+                )
 
-            # Export final GLB
-            from trimesh import load as load_trimesh
-            final_mesh = load_trimesh(textured_mesh_path)
-            output_path = os.path.join(output_dir, f"{image_name}.glb")
-            final_mesh.export(output_path, include_normals=True)
+                # Export final GLB
+                from trimesh import load as load_trimesh
+                final_mesh = load_trimesh(textured_mesh_path)
+                output_path = os.path.join(output_dir, f"{image_name}.glb")
+                final_mesh.export(output_path, include_normals=True)
+                
+                logger.info(f"  [Worker-{thread_id}] Completed SERIALIZED post-processing for {image_name}")
 
             # Update metadata with success
             metadata.update({
