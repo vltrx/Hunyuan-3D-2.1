@@ -841,7 +841,7 @@ class Predictor(BasePredictor):
                 logger.info(f"⚠️  Falling back to SEQUENTIAL processing (insufficient VRAM for {parallel_workers} workers)")
             else:
                 logger.info(f"📋 Using SEQUENTIAL processing")
-                         batch_results = self._process_batch_sequential(image_paths, **kwargs)
+            batch_results = self._process_batch_sequential(image_paths, **kwargs)
         
         # Post-process results to update output mesh paths
         for metadata in batch_results:
