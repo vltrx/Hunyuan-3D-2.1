@@ -80,6 +80,10 @@ degenerate_face_remove_worker = None
 face_reduce_worker = None
 mesh_simplifier = None
 
+# Thread-safe storage for per-worker model instances
+worker_models = {}
+worker_models_lock = threading.Lock()
+
 # Model loading state tracking
 _models_loading_state = {
     'rembg': False,
@@ -182,6 +186,75 @@ def _ensure_postprocessing_loaded():
         mesh_simplifier = MeshSimplifier()
         logger.info("Mesh processing tools loaded")
     return floater_remove_worker, degenerate_face_remove_worker, face_reduce_worker, mesh_simplifier
+
+# Per-Worker Model Loading Functions for Thread Safety
+def _ensure_worker_models_loaded():
+    """Ensure each worker has its own model instances (thread-safe)"""
+    thread_id = threading.current_thread().ident
+    
+    with worker_models_lock:
+        if thread_id not in worker_models:
+            logger.info(f"🔧 [Worker-{thread_id}] Loading dedicated model instances...")
+            
+            # Initialize worker model storage
+            worker_models[thread_id] = {}
+            
+            # Load background removal model
+            logger.info(f"  [Worker-{thread_id}] Loading BackgroundRemover...")
+            worker_models[thread_id]['rembg'] = BackgroundRemover()
+            
+            # Load shape generation model 
+            logger.info(f"  [Worker-{thread_id}] Loading Hunyuan3D shape model...")
+            worker_models[thread_id]['shape'] = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
+                "tencent/Hunyuan3D-2.1"
+            )
+            
+            # Load texture generation model
+            logger.info(f"  [Worker-{thread_id}] Loading texture generation model...")
+            max_num_view = 6
+            resolution = 512
+            tex_conf = Hunyuan3DPaintConfig(max_num_view, resolution)
+            tex_conf.realesrgan_ckpt_path = "hy3dpaint/ckpt/RealESRGAN_x4plus.pth"
+            tex_conf.multiview_cfg_path = "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
+            tex_conf.custom_pipeline = "hy3dpaint/hunyuanpaintpbr"
+            
+            worker_models[thread_id]['texture'] = Hunyuan3DPaintPipeline(tex_conf)
+            
+            # Load post-processing tools (these can be shared as they're stateless)
+            logger.info(f"  [Worker-{thread_id}] Loading mesh processing tools...")
+            worker_models[thread_id]['floater_remover'] = FloaterRemover()
+            worker_models[thread_id]['degenerate_remover'] = DegenerateFaceRemover()
+            worker_models[thread_id]['face_reducer'] = FaceReducer()
+            worker_models[thread_id]['mesh_simplifier'] = MeshSimplifier()
+            
+            logger.info(f"✅ [Worker-{thread_id}] All dedicated models loaded")
+    
+    return worker_models[thread_id]
+
+def _get_worker_model(model_type):
+    """Get specific model instance for current worker thread"""
+    thread_id = threading.current_thread().ident
+    if thread_id in worker_models and model_type in worker_models[thread_id]:
+        return worker_models[thread_id][model_type]
+    else:
+        # Fallback to global models if worker models not loaded
+        if model_type == 'rembg':
+            return _ensure_rembg_loaded()
+        elif model_type == 'shape':
+            return _ensure_shape_model_loaded()
+        elif model_type == 'texture':
+            return _ensure_texture_model_loaded()
+        else:
+            raise ValueError(f"Unknown model type: {model_type}")
+
+def _cleanup_worker_models():
+    """Clean up worker model instances when done"""
+    thread_id = threading.current_thread().ident
+    with worker_models_lock:
+        if thread_id in worker_models:
+            logger.info(f"🧹 [Worker-{thread_id}] Cleaning up worker models...")
+            # Models will be garbage collected
+            del worker_models[thread_id]
 
 def validate_zip_file(zip_path: Path) -> bool:
     """Validate ZIP file integrity"""
@@ -448,6 +521,163 @@ class Predictor(BasePredictor):
             # Never let analytics logging break the main pipeline
             logger.debug(f"Analytics logging failed: {e}")
             pass
+
+    def _process_single_image_worker(self, 
+                            image_input: Union[Path, str], 
+                            output_dir: str,
+                            image_idx: int,
+                            **kwargs) -> dict:
+        """
+        Process a single image using worker-specific model instances (thread-safe)
+        Returns metadata dict for the image
+        """
+        start_time = time.time()
+        thread_id = threading.current_thread().ident
+        
+        # CRITICAL: Always preserve original filename (without extension) for output mesh
+        if isinstance(image_input, str):
+            image_name = os.path.splitext(os.path.basename(image_input))[0]
+        else:
+            image_name = os.path.splitext(os.path.basename(str(image_input)))[0]
+        
+        metadata = {
+            "input_image": image_name,
+            "output_mesh": f"{image_name}.glb",
+            "status": "error",
+            "duration": 0.0,
+            "face_count": 0,
+            "vertex_count": 0,
+            "error": None,
+            "error_type": None
+        }
+        
+        try:
+            # Load and preprocess image with validation
+            if isinstance(image_input, str):
+                if not validate_image_file(image_input):
+                    raise ValueError(f"Invalid image file: {image_input}")
+                input_image = Image.open(image_input).convert("RGB")
+            else:
+                input_image = Image.open(str(image_input)).convert("RGB")
+
+            # Background removal with worker-specific model
+            if kwargs.get('remove_background', True):
+                logger.info(f"  [Worker-{thread_id}] Removing background for {image_name}")
+                rmbg_worker = _get_worker_model('rembg')
+                processed_image = rmbg_worker(input_image)
+            else:
+                processed_image = input_image
+            
+            # Shape generation with worker-specific model
+            logger.info(f"  [Worker-{thread_id}] Starting shape generation for {image_name}")
+            shape_worker = _get_worker_model('shape')
+            
+            # Use worker-specific shape generation
+            generator = torch.Generator()
+            generator = generator.manual_seed(int(kwargs.get('seed', 1234)) + image_idx)
+            
+            outputs = shape_worker(
+                image=processed_image,
+                num_inference_steps=kwargs.get('steps', 50),
+                guidance_scale=kwargs.get('guidance_scale', 5.5),
+                generator=generator,
+                octree_resolution=kwargs.get('octree_resolution', 512),
+                num_chunks=kwargs.get('num_chunks', 200000),
+                output_type='mesh'
+            )
+            
+            # Clean up GPU memory after generation
+            self._cleanup_gpu_memory()
+            
+            # Check if mesh generation was successful
+            if outputs is None or len(outputs) == 0:
+                raise RuntimeError("Shape generation failed - no mesh output")
+            
+            # Convert to trimesh
+            from hy3dshape.pipelines import export_to_trimesh
+            mesh = export_to_trimesh(outputs)[0]
+            if mesh is None or not hasattr(mesh, 'vertices') or len(mesh.vertices) == 0:
+                raise RuntimeError("Shape generation failed - empty mesh")
+            
+            logger.info(f"  [Worker-{thread_id}] Generated mesh - Vertices: {len(mesh.vertices)}, Faces: {len(mesh.faces)}")
+            
+            # Post-process mesh with worker-specific models
+            logger.info(f"  [Worker-{thread_id}] Post-processing mesh for {image_name}")
+            worker_models = _ensure_worker_models_loaded()
+            
+            # Apply post-processing pipeline using worker models
+            mesh_output = worker_models['floater_remover'](mesh)
+            if mesh_output is None or len(mesh_output.vertices) == 0 or len(mesh_output.faces) == 0:
+                raise RuntimeError("Mesh became empty after floater removal")
+                
+            mesh_output = worker_models['degenerate_remover'](mesh_output)
+            if mesh_output is None or len(mesh_output.vertices) == 0 or len(mesh_output.faces) == 0:
+                raise RuntimeError("Mesh became empty after degenerate face removal")
+            
+            # Face reduction (always needed)
+            mesh_output = worker_models['face_reducer'](mesh_output, max_facenum=kwargs.get('max_facenum', 40000))
+            if mesh_output is None or len(mesh_output.vertices) == 0 or len(mesh_output.faces) == 0:
+                raise RuntimeError("Mesh became empty after face reduction")
+                
+            self._cleanup_gpu_memory()
+
+            # Save intermediate mesh
+            temp_mesh_path = os.path.join(output_dir, f"{image_name}_temp.obj")
+            mesh_output.export(temp_mesh_path)
+
+            # Apply texturing with worker-specific model
+            logger.info(f"  [Worker-{thread_id}] Generating texture for {image_name}")
+            tex_pipeline = worker_models['texture']
+            textured_mesh_path = tex_pipeline(
+                mesh_path=temp_mesh_path,
+                image_path=input_image,
+                output_mesh_path=os.path.join(output_dir, f"{image_name}_textured.obj")
+            )
+
+            # Export final GLB
+            from trimesh import load as load_trimesh
+            final_mesh = load_trimesh(textured_mesh_path)
+            output_path = os.path.join(output_dir, f"{image_name}.glb")
+            final_mesh.export(output_path, include_normals=True)
+
+            # Update metadata with success
+            metadata.update({
+                "status": "success",
+                "duration": time.time() - start_time,
+                "face_count": len(final_mesh.faces),
+                "vertex_count": len(final_mesh.vertices),
+                "error": None,
+                "error_type": None
+            })
+
+            # Cleanup intermediate files
+            try:
+                os.remove(temp_mesh_path)
+                if os.path.exists(textured_mesh_path):
+                    os.remove(textured_mesh_path)
+            except:
+                pass  # Don't fail if cleanup fails
+
+            logger.info(f"  [Worker-{thread_id}] ✅ {image_name} completed in {metadata['duration']:.1f}s, faces: {metadata['face_count']}")
+            
+            return metadata
+
+        except Exception as e:
+            error_msg = str(e)
+            error_type = type(e).__name__
+            
+            metadata.update({
+                "status": "error",
+                "duration": time.time() - start_time,
+                "error": error_msg,
+                "error_type": error_type
+            })
+            
+            logger.error(f"[Worker-{thread_id}] Failed to process {image_name}: {error_msg}")
+            logger.error(traceback.format_exc())
+            return metadata
+        finally:
+            self._cleanup_gpu_memory()
 
     def _process_single_image(self, 
                             image_input: Union[Path, str], 
@@ -748,7 +978,7 @@ class Predictor(BasePredictor):
             raise
 
     def _process_image_worker(self, args_tuple):
-        """Worker function for parallel image processing"""
+        """Worker function for parallel image processing with dedicated model instances"""
         idx, image_path, output_dir, kwargs = args_tuple
         
         # Each worker gets its own thread ID for logging
@@ -762,11 +992,14 @@ class Predictor(BasePredictor):
             current_vram = self.vram_monitor.get_available_vram()
             logger.info(f"  [Worker-{thread_id}] VRAM: {current_vram:.1f}GB available")
             
-            if current_vram < 15.0:  # Require 15GB per worker for safety
+            if current_vram < 25.0:  # Require 25GB per worker for dedicated models
                 raise RuntimeError(f"Insufficient VRAM for worker: {current_vram:.1f}GB available")
             
-            # Process the image
-            metadata = self._process_single_image(
+            # Load dedicated model instances for this worker
+            _ensure_worker_models_loaded()
+            
+            # Process the image using worker-specific models
+            metadata = self._process_single_image_worker(
                 image_path,
                 output_dir,
                 idx,
@@ -793,6 +1026,7 @@ class Predictor(BasePredictor):
         finally:
             # Always cleanup after worker
             self._cleanup_gpu_memory()
+            _cleanup_worker_models()
 
     def _predict_batch(self, batch_images: Path, parallel_workers: int = 2, **kwargs) -> Output:
         """
@@ -825,8 +1059,8 @@ class Predictor(BasePredictor):
         logger.info(f"🚀 Starting batch processing: {len(image_paths)} images")
         logger.info(f"💾 Available VRAM: {self.vram_monitor.get_available_vram():.1f}GB")
         
-        # Determine if we can use parallel processing
-        vram_per_worker = 18.0  # Estimated VRAM per worker (GB)
+        # Determine if we can use parallel processing (higher VRAM requirement for dedicated models)
+        vram_per_worker = 30.0  # Estimated VRAM per worker with dedicated models (GB)
         can_parallel = (
             parallel_workers > 1 and 
             len(image_paths) > 1 and
@@ -882,15 +1116,10 @@ class Predictor(BasePredictor):
         )
     
     def _process_batch_parallel(self, image_paths: List[str], parallel_workers: int, **kwargs) -> List[dict]:
-        """Process images in parallel using ThreadPoolExecutor"""
+        """Process images in parallel using ThreadPoolExecutor with dedicated model instances"""
         
-        # Pre-load all models to ensure they're available for all workers
-        logger.info("🔧 Pre-loading models for parallel processing...")
-        _ensure_rembg_loaded()
-        _ensure_shape_model_loaded()
-        _ensure_texture_model_loaded()
-        _ensure_postprocessing_loaded()
-        logger.info("✅ All models pre-loaded")
+        # Note: Models will be loaded per-worker for thread safety
+        logger.info("🔧 Parallel processing will load dedicated models per worker")
         
         # Prepare arguments for workers
         worker_args = [
@@ -913,7 +1142,7 @@ class Predictor(BasePredictor):
             current_vram = self.vram_monitor.get_available_vram()
             logger.info(f"💾 VRAM before batch: {current_vram:.1f}GB")
             
-            if current_vram < 25.0:  # Need substantial VRAM for parallel processing
+            if current_vram < 40.0:  # Need substantial VRAM for parallel processing with dedicated models
                 logger.warning("⚠️  Low VRAM detected, falling back to sequential for remaining images")
                 
                 # Process remaining images sequentially
