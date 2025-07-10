@@ -11,6 +11,8 @@ import zipfile
 from typing import List, Optional, Union
 import gc
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 import torch
 from PIL import Image
@@ -290,24 +292,35 @@ def create_batch_zip(meshes_dir: str, results_json_path: str, output_zip_path: s
                     zip_ref.write(file_path, f'meshes/{filename}')
 
 class VRAMMonitor:
-    """Monitor VRAM usage for batch processing safety"""
+    """Thread-safe VRAM monitor for parallel batch processing"""
     
-    @staticmethod
-    def get_available_vram() -> float:
-        """Get available VRAM in GB"""
-        if not cuda.is_available():
-            return 0.0
+    def __init__(self):
+        self._lock = threading.Lock()
+    
+    def get_available_vram(self) -> float:
+        """Get available VRAM in GB (thread-safe)"""
+        with self._lock:
+            if not cuda.is_available():
+                return 0.0
+            
+            total = cuda.get_device_properties(0).total_memory / 1024**3
+            allocated = cuda.memory_allocated(0) / 1024**3
+            return total - allocated
+    
+    def get_used_vram(self) -> float:
+        """Get used VRAM in GB (thread-safe)"""
+        with self._lock:
+            if not cuda.is_available():
+                return 0.0
+            return cuda.memory_allocated(0) / 1024**3
+    
+    def check_parallel_safety(self, required_per_worker: float, num_workers: int) -> bool:
+        """Check if we have enough VRAM for parallel workers"""
+        available = self.get_available_vram()
+        total_required = required_per_worker * num_workers
+        safety_buffer = 4.0  # 4GB safety buffer
         
-        total = cuda.get_device_properties(0).total_memory / 1024**3
-        allocated = cuda.memory_allocated(0) / 1024**3
-        return total - allocated
-    
-    @staticmethod
-    def get_used_vram() -> float:
-        """Get used VRAM in GB"""
-        if not cuda.is_available():
-            return 0.0
-        return cuda.memory_allocated(0) / 1024**3
+        return available >= (total_required + safety_buffer)
 
 class Predictor(BasePredictor):
     def setup(self) -> None:
@@ -315,8 +328,9 @@ class Predictor(BasePredictor):
         
         logger.info("Setup started - using lazy loading for optimal performance")
         
-        # Initialize VRAM monitor
+        # Initialize VRAM monitor and cleanup lock for thread safety
         self.vram_monitor = VRAMMonitor()
+        self._cleanup_lock = threading.Lock()
         
         # Initial GPU memory cleanup
         self._cleanup_gpu_memory()
@@ -327,11 +341,12 @@ class Predictor(BasePredictor):
         logger.info("Setup completed - models will load on-demand")
     
     def _cleanup_gpu_memory(self):
-        """Clean up GPU memory between predictions"""
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
-            gc.collect()
+        """Thread-safe GPU memory cleanup"""
+        with self._cleanup_lock:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+                gc.collect()
             
     # HF-style shape generation function (mimicking their exact pattern)
     def _hf_style_gen_shape(self, image, steps=50, guidance_scale=5.5, seed=1234, 
@@ -599,6 +614,7 @@ class Predictor(BasePredictor):
         seed: int = Input(description="Random seed for generation", default=1234),
         octree_resolution: int = Input(description="Octree resolution for mesh generation", choices=[256, 384, 512], default=512),
         remove_background: bool = Input(description="Whether to remove background from input image", default=True),
+        parallel_workers: int = Input(description="Number of parallel workers for batch processing (H100 can handle 2-4)", default=2, ge=1, le=4),
     ) -> Output:
         
         start_time = time.time()
@@ -617,7 +633,8 @@ class Predictor(BasePredictor):
                 seed=seed,
                 octree_resolution=octree_resolution,
                 remove_background=remove_background,
-                prompt=prompt
+                prompt=prompt,
+                parallel_workers=parallel_workers
             )
         else:
             return self._predict_single(
@@ -730,7 +747,54 @@ class Predictor(BasePredictor):
             self._log_analytics_event("predict_error", {"error": str(e)})
             raise
 
-    def _predict_batch(self, batch_images: Path, **kwargs) -> Output:
+    def _process_image_worker(self, args_tuple):
+        """Worker function for parallel image processing"""
+        idx, image_path, output_dir, kwargs = args_tuple
+        
+        # Each worker gets its own thread ID for logging
+        thread_id = threading.current_thread().ident
+        image_name = os.path.splitext(os.path.basename(image_path))[0]
+        
+        logger.info(f"🔄 [Worker-{thread_id}] Processing {image_name} ({idx + 1})")
+        
+        try:
+            # Pre-processing VRAM check for this worker
+            current_vram = self.vram_monitor.get_available_vram()
+            logger.info(f"  [Worker-{thread_id}] VRAM: {current_vram:.1f}GB available")
+            
+            if current_vram < 15.0:  # Require 15GB per worker for safety
+                raise RuntimeError(f"Insufficient VRAM for worker: {current_vram:.1f}GB available")
+            
+            # Process the image
+            metadata = self._process_single_image(
+                image_path,
+                output_dir,
+                idx,
+                **kwargs
+            )
+            
+            logger.info(f"✅ [Worker-{thread_id}] Completed {image_name}")
+            return metadata
+            
+        except Exception as e:
+            logger.error(f"❌ [Worker-{thread_id}] Failed {image_name}: {str(e)}")
+            
+            # Return error metadata
+            return {
+                "input_image": image_name,
+                "output_mesh": None,
+                "status": "error",
+                "duration": 0.0,
+                "face_count": 0,
+                "vertex_count": 0,
+                "error": str(e),
+                "error_type": type(e).__name__
+            }
+        finally:
+            # Always cleanup after worker
+            self._cleanup_gpu_memory()
+
+    def _predict_batch(self, batch_images: Path, parallel_workers: int = 2, **kwargs) -> Output:
         """
         Batch processing mode - extract ZIP, process images, create results
         """
@@ -761,55 +825,30 @@ class Predictor(BasePredictor):
         logger.info(f"🚀 Starting batch processing: {len(image_paths)} images")
         logger.info(f"💾 Available VRAM: {self.vram_monitor.get_available_vram():.1f}GB")
         
-        # Process images sequentially
-        batch_results = []
+        # Determine if we can use parallel processing
+        vram_per_worker = 18.0  # Estimated VRAM per worker (GB)
+        can_parallel = (
+            parallel_workers > 1 and 
+            len(image_paths) > 1 and
+            self.vram_monitor.check_parallel_safety(vram_per_worker, parallel_workers)
+        )
         
-        for idx, image_path in enumerate(image_paths):
-            logger.info(f"\n📸 Processing image {idx + 1}/{len(image_paths)}: {os.path.basename(image_path)}")
-            
-            # Pre-processing safety check with better logging
-            current_vram = self.vram_monitor.get_available_vram()
-            logger.info(f"  VRAM before image {idx + 1}: {current_vram:.1f}GB available")
-            
-            if not self._check_memory_safety():
-                logger.error(f"Insufficient VRAM for image {idx + 1}, skipping remaining images")
-                logger.info(f"  Consider processing images in smaller batches or using a GPU with more VRAM")
-                
-                # Add error entries for remaining images
-                for remaining_idx in range(idx, len(image_paths)):
-                    remaining_path = image_paths[remaining_idx]
-                    image_name = os.path.splitext(os.path.basename(remaining_path))[0]
-                    error_metadata = {
-                        "input_image": image_name,
-                        "output_mesh": None,
-                        "status": "error",
-                        "duration": 0.0,
-                        "face_count": 0,
-                        "vertex_count": 0,
-                        "error": "Insufficient VRAM",
-                        "error_type": "RuntimeError"
-                    }
-                    batch_results.append(error_metadata)
-                break
-            
-            # Process single image
-            metadata = self._process_single_image(
-                image_path,
-                "output/meshes",
-                idx,
-                **kwargs
-            )
-            
-            # Update output mesh path for successful results
+        if can_parallel:
+            logger.info(f"🔥 Using PARALLEL processing with {parallel_workers} workers")
+            batch_results = self._process_batch_parallel(image_paths, parallel_workers, **kwargs)
+        else:
+            if parallel_workers > 1:
+                logger.info(f"⚠️  Falling back to SEQUENTIAL processing (insufficient VRAM for {parallel_workers} workers)")
+            else:
+                logger.info(f"📋 Using SEQUENTIAL processing")
+                         batch_results = self._process_batch_sequential(image_paths, **kwargs)
+        
+        # Post-process results to update output mesh paths
+        for metadata in batch_results:
             if metadata['status'] == 'success':
                 metadata['output_mesh'] = f"{metadata['input_image']}.glb"
             else:
                 metadata['output_mesh'] = None
-            
-            batch_results.append(metadata)
-            
-            # Cleanup between images
-            self._cleanup_gpu_memory()
         
         # Generate batch results JSON
         results_json_path = "output/batch_results.json"
@@ -840,4 +879,129 @@ class Predictor(BasePredictor):
         return Output(
             mesh=Path(batch_zip_path),
             batch_results=Path(results_json_path)
-        ) 
+        )
+    
+    def _process_batch_parallel(self, image_paths: List[str], parallel_workers: int, **kwargs) -> List[dict]:
+        """Process images in parallel using ThreadPoolExecutor"""
+        
+        # Pre-load all models to ensure they're available for all workers
+        logger.info("🔧 Pre-loading models for parallel processing...")
+        _ensure_rembg_loaded()
+        _ensure_shape_model_loaded()
+        _ensure_texture_model_loaded()
+        _ensure_postprocessing_loaded()
+        logger.info("✅ All models pre-loaded")
+        
+        # Prepare arguments for workers
+        worker_args = [
+            (idx, image_path, "output/meshes", kwargs)
+            for idx, image_path in enumerate(image_paths)
+        ]
+        
+        batch_results = []
+        
+        # Process in batches to manage memory better
+        batch_size = parallel_workers * 2  # Process 2 batches per worker set
+        
+        for batch_start in range(0, len(worker_args), batch_size):
+            batch_end = min(batch_start + batch_size, len(worker_args))
+            current_batch = worker_args[batch_start:batch_end]
+            
+            logger.info(f"🔄 Processing batch {batch_start//batch_size + 1}: images {batch_start + 1}-{batch_end}")
+            
+            # Check VRAM before each batch
+            current_vram = self.vram_monitor.get_available_vram()
+            logger.info(f"💾 VRAM before batch: {current_vram:.1f}GB")
+            
+            if current_vram < 25.0:  # Need substantial VRAM for parallel processing
+                logger.warning("⚠️  Low VRAM detected, falling back to sequential for remaining images")
+                
+                # Process remaining images sequentially
+                remaining_args = worker_args[batch_start:]
+                for idx, image_path, output_dir, kwargs_dict in remaining_args:
+                    metadata = self._process_single_image(image_path, output_dir, idx, **kwargs_dict)
+                    batch_results.append(metadata)
+                break
+            
+            # Execute parallel batch
+            with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
+                # Submit all jobs in current batch
+                future_to_args = {
+                    executor.submit(self._process_image_worker, args): args 
+                    for args in current_batch
+                }
+                
+                # Collect results as they complete
+                for future in as_completed(future_to_args):
+                    try:
+                        result = future.result(timeout=600)  # 10 minute timeout per image
+                        batch_results.append(result)
+                    except Exception as e:
+                        # Handle worker failure
+                        args = future_to_args[future]
+                        _, image_path, _, _ = args
+                        image_name = os.path.splitext(os.path.basename(image_path))[0]
+                        
+                        error_metadata = {
+                            "input_image": image_name,
+                            "output_mesh": None,
+                            "status": "error",
+                            "duration": 0.0,
+                            "face_count": 0,
+                            "vertex_count": 0,
+                            "error": f"Worker timeout or error: {str(e)}",
+                            "error_type": type(e).__name__
+                        }
+                        batch_results.append(error_metadata)
+                        logger.error(f"❌ Worker failed for {image_name}: {str(e)}")
+            
+            # Cleanup between batches
+            self._cleanup_gpu_memory()
+            time.sleep(1)  # Brief pause between batches
+        
+        return batch_results
+    
+    def _process_batch_sequential(self, image_paths: List[str], **kwargs) -> List[dict]:
+        """Process images sequentially (fallback method)"""
+        batch_results = []
+        
+        for idx, image_path in enumerate(image_paths):
+            logger.info(f"\n📸 Processing image {idx + 1}/{len(image_paths)}: {os.path.basename(image_path)}")
+            
+            # Pre-processing safety check
+            current_vram = self.vram_monitor.get_available_vram()
+            logger.info(f"  VRAM before image {idx + 1}: {current_vram:.1f}GB available")
+            
+            if not self._check_memory_safety():
+                logger.error(f"Insufficient VRAM for image {idx + 1}, skipping remaining images")
+                
+                # Add error entries for remaining images
+                for remaining_idx in range(idx, len(image_paths)):
+                    remaining_path = image_paths[remaining_idx]
+                    image_name = os.path.splitext(os.path.basename(remaining_path))[0]
+                    error_metadata = {
+                        "input_image": image_name,
+                        "output_mesh": None,
+                        "status": "error",
+                        "duration": 0.0,
+                        "face_count": 0,
+                        "vertex_count": 0,
+                        "error": "Insufficient VRAM",
+                        "error_type": "RuntimeError"
+                    }
+                    batch_results.append(error_metadata)
+                break
+            
+            # Process single image
+            metadata = self._process_single_image(
+                image_path,
+                "output/meshes",
+                idx,
+                **kwargs
+            )
+            batch_results.append(metadata)
+            
+            # Cleanup between images
+            self._cleanup_gpu_memory()
+        
+        return batch_results 
