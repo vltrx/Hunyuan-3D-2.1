@@ -84,8 +84,8 @@ mesh_simplifier = None
 worker_models = {}
 worker_models_lock = threading.Lock()
 
-# Post-processing serialization lock
-postprocessing_lock = threading.Lock()
+# Post-processing serialization lock (only for mesh processing)
+mesh_processing_lock = threading.Lock()
 
 # Volume decoding serialization lock - prevents memory collision during parallel processing
 volume_decoding_lock = threading.Lock()
@@ -798,10 +798,10 @@ class Predictor(BasePredictor):
             
             logger.info(f"  [Worker-{thread_id}] Generated mesh - Vertices: {len(mesh.vertices)}, Faces: {len(mesh.faces)}")
             
-            # SERIALIZE post-processing to prevent memory overload
-            logger.info(f"  [Worker-{thread_id}] Waiting for post-processing slot...")
-            with postprocessing_lock:
-                logger.info(f"  [Worker-{thread_id}] Starting SERIALIZED post-processing for {image_name}")
+            # SERIALIZE ONLY mesh processing to prevent memory overload
+            logger.info(f"  [Worker-{thread_id}] Waiting for mesh processing slot...")
+            with mesh_processing_lock:
+                logger.info(f"  [Worker-{thread_id}] Starting SERIALIZED mesh processing for {image_name}")
                 
                 # Apply post-processing pipeline using worker models (SERIALIZED)
                 mesh_output = worker_models_set['floater_remover'](mesh)
@@ -822,22 +822,24 @@ class Predictor(BasePredictor):
                 # Save intermediate mesh
                 temp_mesh_path = os.path.join(output_dir, f"{image_name}_temp.obj")
                 mesh_output.export(temp_mesh_path)
-
-                # Apply texturing with worker-specific model (SERIALIZED)
-                logger.info(f"  [Worker-{thread_id}] Generating texture for {image_name}")
-                textured_mesh_path = worker_models_set['texture'](
-                    mesh_path=temp_mesh_path,
-                    image_path=input_image,
-                    output_mesh_path=os.path.join(output_dir, f"{image_name}_textured.obj")
-                )
-
-                # Export final GLB
-                from trimesh import load as load_trimesh
-                final_mesh = load_trimesh(textured_mesh_path)
-                output_path = os.path.join(output_dir, f"{image_name}.glb")
-                final_mesh.export(output_path, include_normals=True)
                 
-                logger.info(f"  [Worker-{thread_id}] Completed SERIALIZED post-processing for {image_name}")
+                logger.info(f"  [Worker-{thread_id}] Completed SERIALIZED mesh processing for {image_name}")
+
+            # PARALLEL texture generation (no serialization needed - uses different models)
+            logger.info(f"  [Worker-{thread_id}] Generating texture for {image_name} (PARALLEL)")
+            textured_mesh_path = worker_models_set['texture'](
+                mesh_path=temp_mesh_path,
+                image_path=input_image,
+                output_mesh_path=os.path.join(output_dir, f"{image_name}_textured.obj")
+            )
+
+            # Export final GLB
+            from trimesh import load as load_trimesh
+            final_mesh = load_trimesh(textured_mesh_path)
+            output_path = os.path.join(output_dir, f"{image_name}.glb")
+            final_mesh.export(output_path, include_normals=True)
+            
+            logger.info(f"  [Worker-{thread_id}] Completed PARALLEL texture generation for {image_name}")
 
             # Update metadata with success
             metadata.update({
