@@ -90,6 +90,9 @@ mesh_processing_lock = threading.Lock()
 # Volume decoding serialization lock - prevents memory collision during parallel processing
 volume_decoding_lock = threading.Lock()
 
+# Texture generation lock - prevents VRAM overload during parallel texture generation
+texture_generation_lock = threading.Lock()
+
 # Monkey patch volume decoding to prevent memory collision during parallel processing
 def _patched_latents2mesh(self, latents: torch.FloatTensor, **kwargs):
     """Patched latents2mesh method that serializes volume decoding operations"""
@@ -825,21 +828,36 @@ class Predictor(BasePredictor):
                 
                 logger.info(f"  [Worker-{thread_id}] Completed SERIALIZED mesh processing for {image_name}")
 
-            # PARALLEL texture generation (no serialization needed - uses different models)
-            logger.info(f"  [Worker-{thread_id}] Generating texture for {image_name} (PARALLEL)")
-            textured_mesh_path = worker_models_set['texture'](
-                mesh_path=temp_mesh_path,
-                image_path=input_image,
-                output_mesh_path=os.path.join(output_dir, f"{image_name}_textured.obj")
-            )
+            # MEMORY-AWARE texture generation - parallel if safe, serialized if needed
+            available_vram = self.vram_monitor.get_available_vram()
+            texture_memory_estimate = 18.0  # GB - conservative estimate for texture generation
+            
+            if available_vram > texture_memory_estimate + 5.0:  # 5GB safety buffer
+                # Sufficient VRAM for parallel texture generation
+                logger.info(f"  [Worker-{thread_id}] Generating texture for {image_name} (PARALLEL - {available_vram:.1f}GB available)")
+                textured_mesh_path = worker_models_set['texture'](
+                    mesh_path=temp_mesh_path,
+                    image_path=input_image,
+                    output_mesh_path=os.path.join(output_dir, f"{image_name}_textured.obj")
+                )
+                logger.info(f"  [Worker-{thread_id}] Completed PARALLEL texture generation for {image_name}")
+            else:
+                # Insufficient VRAM - serialize texture generation for safety
+                logger.info(f"  [Worker-{thread_id}] Waiting for texture generation slot (VRAM: {available_vram:.1f}GB)")
+                with texture_generation_lock:
+                    logger.info(f"  [Worker-{thread_id}] Generating texture for {image_name} (SERIALIZED for VRAM safety)")
+                    textured_mesh_path = worker_models_set['texture'](
+                        mesh_path=temp_mesh_path,
+                        image_path=input_image,
+                        output_mesh_path=os.path.join(output_dir, f"{image_name}_textured.obj")
+                    )
+                    logger.info(f"  [Worker-{thread_id}] Completed SERIALIZED texture generation for {image_name}")
 
             # Export final GLB
             from trimesh import load as load_trimesh
             final_mesh = load_trimesh(textured_mesh_path)
             output_path = os.path.join(output_dir, f"{image_name}.glb")
             final_mesh.export(output_path, include_normals=True)
-            
-            logger.info(f"  [Worker-{thread_id}] Completed PARALLEL texture generation for {image_name}")
 
             # Update metadata with success
             metadata.update({
