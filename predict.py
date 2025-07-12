@@ -93,19 +93,21 @@ volume_decoding_lock = threading.Lock()
 # Monkey patch volume decoding to prevent memory collision during parallel processing
 def _patched_latents2mesh(self, latents: torch.FloatTensor, **kwargs):
     """Patched latents2mesh method that serializes volume decoding operations"""
-    # Import the timer function
-    from hy3dshape.utils.misc import synchronize_timer
+    import time
     
     # Serialize volume decoding to prevent memory collision
     with volume_decoding_lock:
         logger.info("  🔒 Acquiring volume decoding lock for serialized processing...")
-        with synchronize_timer('Volume decoding'):
-            grid_logits = self.volume_decoder(latents, self.geo_decoder, **kwargs)
-        logger.info("  🔓 Volume decoding completed, releasing lock...")
+        start_time = time.time()
+        grid_logits = self.volume_decoder(latents, self.geo_decoder, **kwargs)
+        decode_time = time.time() - start_time
+        logger.info(f"  🔓 Volume decoding completed in {decode_time:.1f}s, releasing lock...")
     
     # Surface extraction can still run in parallel
-    with synchronize_timer('Surface extraction'):
-        outputs = self.surface_extractor(grid_logits, **kwargs)
+    start_time = time.time()
+    outputs = self.surface_extractor(grid_logits, **kwargs)
+    extract_time = time.time() - start_time
+    logger.info(f"  Surface extraction completed in {extract_time:.1f}s")
     return outputs
 
 # Apply the monkey patch
