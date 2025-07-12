@@ -130,12 +130,15 @@ def _apply_texture_generation_patch():
     try:
         from hy3dpaint.textureGenPipeline import Hunyuan3DPaintPipeline
         
+        logger.info("🔧 Applying texture generation patch...")
+        
         # Store original method
         original_call = Hunyuan3DPaintPipeline.__call__
         
         def patched_call(self, mesh_path=None, image_path=None, output_mesh_path=None, use_remesh=True, save_glb=True):
             """Patched texture generation with worker-specific temp file paths"""
             thread_id = threading.current_thread().ident
+            logger.info(f"📦 [Worker-{thread_id}] Using PATCHED texture generation pipeline")
             
             # Create worker-specific temp directory for remesh files
             import tempfile
@@ -151,6 +154,7 @@ def _apply_texture_generation_patch():
                 
                 # Create worker-specific remesh filename in the same directory
                 processed_mesh_path = os.path.join(mesh_dir, f"white_mesh_remesh_worker_{thread_id}.obj")
+                logger.info(f"📦 [Worker-{thread_id}] Creating worker-specific remesh file: {processed_mesh_path}")
                 
                 # Call remesh with worker-specific path
                 from hy3dpaint.utils.simplify_mesh_utils import remesh_mesh
@@ -593,8 +597,7 @@ class Predictor(BasePredictor):
         # Apply volume decoding serialization patch for parallel processing safety
         _apply_volume_decoding_patch()
         
-        # Apply texture generation worker-specific file path patch for parallel texture processing
-        _apply_texture_generation_patch()
+        # Note: texture generation patch is applied after worker models are loaded in _preload_worker_models()
         
         # Initialize VRAM monitor and cleanup lock for thread safety
         self.vram_monitor = VRAMMonitor()
@@ -1406,6 +1409,10 @@ class Predictor(BasePredictor):
                     worker_models[worker_key]['mesh_simplifier'] = MeshSimplifier()
                     
                     logger.info(f"  ✅ {worker_key} models loaded")
+        
+        # Apply texture generation patch AFTER all worker models are loaded
+        logger.info("🔧 Applying texture generation patch to worker models...")
+        _apply_texture_generation_patch()
         
         logger.info(f"✅ All {num_workers} worker model sets pre-loaded")
 
