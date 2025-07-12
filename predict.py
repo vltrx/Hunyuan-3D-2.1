@@ -146,11 +146,11 @@ def _apply_texture_generation_patch():
             
             # Create worker-specific remesh path
             if use_remesh:
-                worker_temp_dir = os.path.join(mesh_dir, f"worker_{thread_id}_temp")
-                os.makedirs(worker_temp_dir, exist_ok=True)
+                # Ensure the mesh directory exists
+                os.makedirs(mesh_dir, exist_ok=True)
                 
-                # Use worker-specific remesh filename
-                processed_mesh_path = os.path.join(worker_temp_dir, f"white_mesh_remesh_worker_{thread_id}.obj")
+                # Create worker-specific remesh filename in the same directory
+                processed_mesh_path = os.path.join(mesh_dir, f"white_mesh_remesh_worker_{thread_id}.obj")
                 
                 # Call remesh with worker-specific path
                 from hy3dpaint.utils.simplify_mesh_utils import remesh_mesh
@@ -257,11 +257,11 @@ def _apply_texture_generation_patch():
                 convert_obj_to_glb(output_mesh_path, output_mesh_path.replace(".obj", ".glb"))
                 output_glb_path = output_mesh_path.replace(".obj", ".glb")
 
-            # Cleanup worker-specific temp directory
+            # Cleanup worker-specific remesh file
             if use_remesh:
                 try:
-                    import shutil
-                    shutil.rmtree(worker_temp_dir)
+                    if os.path.exists(processed_mesh_path):
+                        os.remove(processed_mesh_path)
                 except:
                     pass  # Don't fail if cleanup fails
             
