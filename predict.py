@@ -87,6 +87,38 @@ worker_models_lock = threading.Lock()
 # Post-processing serialization lock
 postprocessing_lock = threading.Lock()
 
+# Volume decoding serialization lock - prevents memory collision during parallel processing
+volume_decoding_lock = threading.Lock()
+
+# Monkey patch volume decoding to prevent memory collision during parallel processing
+def _patched_latents2mesh(self, latents: torch.FloatTensor, **kwargs):
+    """Patched latents2mesh method that serializes volume decoding operations"""
+    # Import the timer function
+    from hy3dshape.utils.misc import synchronize_timer
+    
+    # Serialize volume decoding to prevent memory collision
+    with volume_decoding_lock:
+        logger.info("  🔒 Acquiring volume decoding lock for serialized processing...")
+        with synchronize_timer('Volume decoding'):
+            grid_logits = self.volume_decoder(latents, self.geo_decoder, **kwargs)
+        logger.info("  🔓 Volume decoding completed, releasing lock...")
+    
+    # Surface extraction can still run in parallel
+    with synchronize_timer('Surface extraction'):
+        outputs = self.surface_extractor(grid_logits, **kwargs)
+    return outputs
+
+# Apply the monkey patch
+def _apply_volume_decoding_patch():
+    """Apply the volume decoding serialization patch"""
+    try:
+        from hy3dshape.models.autoencoders.model import VectsetVAE
+        # Replace the original method with our patched version
+        VectsetVAE.latents2mesh = _patched_latents2mesh
+        logger.info("✅ Volume decoding serialization patch applied successfully")
+    except ImportError as e:
+        logger.warning(f"⚠️ Could not apply volume decoding patch: {e}")
+
 # Model loading state tracking
 _models_loading_state = {
     'rembg': False,
@@ -401,6 +433,9 @@ class Predictor(BasePredictor):
         """Fast setup for Replicate - models loaded on-demand for optimal cold start"""
         
         logger.info("Setup started - using lazy loading for optimal performance")
+        
+        # Apply volume decoding serialization patch for parallel processing safety
+        _apply_volume_decoding_patch()
         
         # Initialize VRAM monitor and cleanup lock for thread safety
         self.vram_monitor = VRAMMonitor()
