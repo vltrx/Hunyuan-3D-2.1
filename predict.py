@@ -124,6 +124,157 @@ def _apply_volume_decoding_patch():
     except ImportError as e:
         logger.warning(f"⚠️ Could not apply volume decoding patch: {e}")
 
+def _apply_texture_generation_patch():
+    """Apply texture generation worker-specific file path patch"""
+    import threading
+    try:
+        from hy3dpaint.textureGenPipeline import Hunyuan3DPaintPipeline
+        
+        # Store original method
+        original_call = Hunyuan3DPaintPipeline.__call__
+        
+        def patched_call(self, mesh_path=None, image_path=None, output_mesh_path=None, use_remesh=True, save_glb=True):
+            """Patched texture generation with worker-specific temp file paths"""
+            thread_id = threading.current_thread().ident
+            
+            # Create worker-specific temp directory for remesh files
+            import tempfile
+            import os
+            
+            # Get the directory of the mesh path for context
+            mesh_dir = os.path.dirname(mesh_path)
+            
+            # Create worker-specific remesh path
+            if use_remesh:
+                worker_temp_dir = os.path.join(mesh_dir, f"worker_{thread_id}_temp")
+                os.makedirs(worker_temp_dir, exist_ok=True)
+                
+                # Use worker-specific remesh filename
+                processed_mesh_path = os.path.join(worker_temp_dir, f"white_mesh_remesh_worker_{thread_id}.obj")
+                
+                # Call remesh with worker-specific path
+                from hy3dpaint.utils.simplify_mesh_utils import remesh_mesh
+                remesh_mesh(mesh_path, processed_mesh_path)
+            else:
+                processed_mesh_path = mesh_path
+            
+            # Continue with original logic but use our processed_mesh_path
+            from PIL import Image
+            from typing import List
+            import trimesh
+            import copy
+            import numpy as np
+            import torch
+            
+            # Ensure image_prompt is a list
+            if isinstance(image_path, str):
+                image_prompt = Image.open(image_path)
+            elif isinstance(image_path, Image.Image):
+                image_prompt = image_path
+            if not isinstance(image_prompt, List):
+                image_prompt = [image_prompt]
+            else:
+                image_prompt = image_path
+
+            # Output path
+            if output_mesh_path is None:
+                output_mesh_path = os.path.join(os.path.dirname(mesh_path), f"textured_mesh.obj")
+
+            # Load mesh
+            mesh = trimesh.load(processed_mesh_path)
+            from hy3dpaint.utils.uvwrap_utils import mesh_uv_wrap
+            mesh = mesh_uv_wrap(mesh)
+            self.render.load_mesh(mesh=mesh)
+
+            ########### View Selection #########
+            selected_camera_elevs, selected_camera_azims, selected_view_weights = self.view_processor.bake_view_selection(
+                self.config.candidate_camera_elevs,
+                self.config.candidate_camera_azims,
+                self.config.candidate_view_weights,
+                self.config.max_selected_view_num,
+            )
+
+            normal_maps = self.view_processor.render_normal_multiview(
+                selected_camera_elevs, selected_camera_azims, use_abs_coor=True
+            )
+            position_maps = self.view_processor.render_position_multiview(selected_camera_elevs, selected_camera_azims)
+
+            ##########  Style  ###########
+            image_caption = "high quality"
+            image_style = []
+            for image in image_prompt:
+                image = image.resize((512, 512))
+                if image.mode == "RGBA":
+                    white_bg = Image.new("RGB", image.size, (255, 255, 255))
+                    white_bg.paste(image, mask=image.getchannel("A"))
+                    image = white_bg
+                image_style.append(image)
+            image_style = [image.convert("RGB") for image in image_style]
+
+            ###########  Multiview  ##########
+            multiviews_pbr = self.models["multiview_model"](
+                image_style,
+                normal_maps + position_maps,
+                prompt=image_caption,
+                custom_view_size=self.config.resolution,
+                resize_input=True,
+            )
+            ###########  Enhance  ##########
+            enhance_images = {}
+            enhance_images["albedo"] = copy.deepcopy(multiviews_pbr["albedo"])
+            enhance_images["mr"] = copy.deepcopy(multiviews_pbr["mr"])
+
+            for i in range(len(enhance_images["albedo"])):
+                enhance_images["albedo"][i] = self.models["super_model"](enhance_images["albedo"][i])
+                enhance_images["mr"][i] = self.models["super_model"](enhance_images["mr"][i])
+
+            ###########  Bake  ##########
+            for i in range(len(enhance_images)):
+                enhance_images["albedo"][i] = enhance_images["albedo"][i].resize(
+                    (self.config.render_size, self.config.render_size)
+                )
+                enhance_images["mr"][i] = enhance_images["mr"][i].resize((self.config.render_size, self.config.render_size))
+            texture, mask = self.view_processor.bake_from_multiview(
+                enhance_images["albedo"], selected_camera_elevs, selected_camera_azims, selected_view_weights
+            )
+            mask_np = (mask.squeeze(-1).cpu().numpy() * 255).astype(np.uint8)
+            texture_mr, mask_mr = self.view_processor.bake_from_multiview(
+                enhance_images["mr"], selected_camera_elevs, selected_camera_azims, selected_view_weights
+            )
+            mask_mr_np = (mask_mr.squeeze(-1).cpu().numpy() * 255).astype(np.uint8)
+
+            ##########  inpaint  ###########
+            texture = self.view_processor.texture_inpaint(texture, mask_np)
+            self.render.set_texture(texture, force_set=True)
+            if "mr" in enhance_images:
+                texture_mr = self.view_processor.texture_inpaint(texture_mr, mask_mr_np)
+                self.render.set_texture_mr(texture_mr)
+
+            self.render.save_mesh(output_mesh_path, downsample=True)
+
+            if save_glb:
+                from hy3dpaint.DifferentiableRenderer.mesh_utils import convert_obj_to_glb
+                convert_obj_to_glb(output_mesh_path, output_mesh_path.replace(".obj", ".glb"))
+                output_glb_path = output_mesh_path.replace(".obj", ".glb")
+
+            # Cleanup worker-specific temp directory
+            if use_remesh:
+                try:
+                    import shutil
+                    shutil.rmtree(worker_temp_dir)
+                except:
+                    pass  # Don't fail if cleanup fails
+            
+            return output_mesh_path
+        
+        # Apply the patch
+        Hunyuan3DPaintPipeline.__call__ = patched_call
+        logger.info("✅ Texture generation worker-specific file path patch applied successfully")
+    except ImportError as e:
+        logger.warning(f"⚠️ Could not apply texture generation patch: {e}")
+    except Exception as e:
+        logger.warning(f"⚠️ Texture generation patch failed: {e}")
+
 # Model loading state tracking
 _models_loading_state = {
     'rembg': False,
@@ -441,6 +592,9 @@ class Predictor(BasePredictor):
         
         # Apply volume decoding serialization patch for parallel processing safety
         _apply_volume_decoding_patch()
+        
+        # Apply texture generation worker-specific file path patch for parallel texture processing
+        _apply_texture_generation_patch()
         
         # Initialize VRAM monitor and cleanup lock for thread safety
         self.vram_monitor = VRAMMonitor()
@@ -828,17 +982,24 @@ class Predictor(BasePredictor):
                 
                 logger.info(f"  [Worker-{thread_id}] Completed SERIALIZED mesh processing for {image_name}")
 
-            # MEMORY-AWARE texture generation - parallel if safe, serialized if needed
+            # MEMORY-AWARE texture generation with worker-specific file paths
             available_vram = self.vram_monitor.get_available_vram()
             texture_memory_estimate = 18.0  # GB - conservative estimate for texture generation
+            
+            # Create worker-specific temp mesh path to prevent file conflicts
+            worker_temp_mesh_path = os.path.join(output_dir, f"{image_name}_worker_{thread_id}_temp.obj")
+            
+            # Copy the mesh to worker-specific path to prevent conflicts
+            import shutil
+            shutil.copy2(temp_mesh_path, worker_temp_mesh_path)
             
             if available_vram > texture_memory_estimate + 5.0:  # 5GB safety buffer
                 # Sufficient VRAM for parallel texture generation
                 logger.info(f"  [Worker-{thread_id}] Generating texture for {image_name} (PARALLEL - {available_vram:.1f}GB available)")
                 textured_mesh_path = worker_models_set['texture'](
-                    mesh_path=temp_mesh_path,
+                    mesh_path=worker_temp_mesh_path,
                     image_path=input_image,
-                    output_mesh_path=os.path.join(output_dir, f"{image_name}_textured.obj")
+                    output_mesh_path=os.path.join(output_dir, f"{image_name}_worker_{thread_id}_textured.obj")
                 )
                 logger.info(f"  [Worker-{thread_id}] Completed PARALLEL texture generation for {image_name}")
             else:
@@ -847,11 +1008,17 @@ class Predictor(BasePredictor):
                 with texture_generation_lock:
                     logger.info(f"  [Worker-{thread_id}] Generating texture for {image_name} (SERIALIZED for VRAM safety)")
                     textured_mesh_path = worker_models_set['texture'](
-                        mesh_path=temp_mesh_path,
+                        mesh_path=worker_temp_mesh_path,
                         image_path=input_image,
-                        output_mesh_path=os.path.join(output_dir, f"{image_name}_textured.obj")
+                        output_mesh_path=os.path.join(output_dir, f"{image_name}_worker_{thread_id}_textured.obj")
                     )
                     logger.info(f"  [Worker-{thread_id}] Completed SERIALIZED texture generation for {image_name}")
+
+            # Clean up worker-specific temp file
+            try:
+                os.remove(worker_temp_mesh_path)
+            except:
+                pass  # Don't fail if cleanup fails
 
             # Export final GLB
             from trimesh import load as load_trimesh
