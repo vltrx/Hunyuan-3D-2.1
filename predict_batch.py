@@ -116,10 +116,10 @@ class BatchPredictor(BasePredictor):
             le=200000,
         ),
         num_chunks: int = Input(
-            description="Number of chunks for mesh generation",
+            description="Number of chunks for mesh generation (H100 140GB: use 4-5M chunks)",
             default=8000,
             ge=1000,
-            le=200000,
+            le=5000000,
         ),
         seed: int = Input(
             description="Random seed for generation",

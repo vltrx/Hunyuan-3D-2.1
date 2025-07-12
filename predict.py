@@ -1002,7 +1002,7 @@ class Predictor(BasePredictor):
         steps: int = Input(description="Number of inference steps", default=50, ge=20, le=50),
         guidance_scale: float = Input(description="Guidance scale for generation", default=5.5, ge=1.0, le=20.0),
         max_facenum: int = Input(description="Maximum number of faces for mesh generation", default=40000, ge=10000, le=200000),
-        num_chunks: int = Input(description="Number of chunks for mesh generation", default=200000, ge=10000, le=200000),
+        num_chunks: int = Input(description="Number of chunks for mesh generation (H100 140GB: use 4-5M chunks)", default=200000, ge=10000, le=5000000),
         seed: int = Input(description="Random seed for generation", default=1234),
         octree_resolution: int = Input(description="Octree resolution for mesh generation", choices=[256, 384, 512], default=512),
         remove_background: bool = Input(description="Whether to remove background from input image", default=True),

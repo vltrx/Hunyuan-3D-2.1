@@ -169,7 +169,7 @@ output = replicate.run(
 
 ### Batch Settings
 - `max_batch_size` (int): Maximum images per batch (1-25, default: 10)
-- `num_chunks` (int): Processing chunks (1000-200000, default: 8000)
+- `num_chunks` (int): Processing chunks (1000-5000000, default: 8000, H100 140GB: use 4-5M chunks)
 
 ### Other Settings
 - `seed` (int): Random seed for reproducible results (default: 1234)
