@@ -115,170 +115,21 @@ def _patched_latents2mesh(self, latents: torch.FloatTensor, **kwargs):
 
 # Apply the monkey patch
 def _apply_volume_decoding_patch():
-    """Apply the volume decoding serialization patch"""
+    """Apply volume decoding serialization patch for parallel processing safety"""
     try:
-        from hy3dshape.models.autoencoders.model import VectsetVAE
-        # Replace the original method with our patched version
-        VectsetVAE.latents2mesh = _patched_latents2mesh
+        from hy3dshape.hy3dshape.pipelines import Hunyuan3DDiTFlowMatchingPipeline
+
+        # Store original method
+        original_latents2mesh = Hunyuan3DDiTFlowMatchingPipeline.latents2mesh
+
+        # Apply the patch
+        Hunyuan3DDiTFlowMatchingPipeline.latents2mesh = _patched_latents2mesh
         logger.info("✅ Volume decoding serialization patch applied successfully")
     except ImportError as e:
         logger.warning(f"⚠️ Could not apply volume decoding patch: {e}")
-
-def _apply_texture_generation_patch():
-    """Apply texture generation worker-specific file path patch"""
-    import threading
-    try:
-        from hy3dpaint.textureGenPipeline import Hunyuan3DPaintPipeline
-        
-        logger.info("🔧 Applying texture generation patch...")
-        
-        # Store original method
-        original_call = Hunyuan3DPaintPipeline.__call__
-        
-        def patched_call(self, mesh_path=None, image_path=None, output_mesh_path=None, use_remesh=True, save_glb=True):
-            """Patched texture generation with worker-specific temp file paths"""
-            thread_id = threading.current_thread().ident
-            logger.info(f"📦 [Worker-{thread_id}] Using PATCHED texture generation pipeline")
-            
-            # Create worker-specific temp directory for remesh files
-            import tempfile
-            import os
-            
-            # Get the directory of the mesh path for context
-            mesh_dir = os.path.dirname(mesh_path)
-            
-            # Create worker-specific remesh path
-            if use_remesh:
-                # Ensure the mesh directory exists
-                os.makedirs(mesh_dir, exist_ok=True)
-                
-                # Create worker-specific remesh filename in the same directory
-                processed_mesh_path = os.path.join(mesh_dir, f"white_mesh_remesh_worker_{thread_id}.obj")
-                logger.info(f"📦 [Worker-{thread_id}] Creating worker-specific remesh file: {processed_mesh_path}")
-                
-                # Call remesh with worker-specific path
-                from hy3dpaint.utils.simplify_mesh_utils import remesh_mesh
-                remesh_mesh(mesh_path, processed_mesh_path)
-            else:
-                processed_mesh_path = mesh_path
-            
-            # Continue with original logic but use our processed_mesh_path
-            from PIL import Image
-            from typing import List
-            import trimesh
-            import copy
-            import numpy as np
-            import torch
-            
-            # Ensure image_prompt is a list
-            if isinstance(image_path, str):
-                image_prompt = Image.open(image_path)
-            elif isinstance(image_path, Image.Image):
-                image_prompt = image_path
-            if not isinstance(image_prompt, List):
-                image_prompt = [image_prompt]
-            else:
-                image_prompt = image_path
-
-            # Output path
-            if output_mesh_path is None:
-                output_mesh_path = os.path.join(os.path.dirname(mesh_path), f"textured_mesh.obj")
-
-            # Load mesh
-            mesh = trimesh.load(processed_mesh_path)
-            from hy3dpaint.utils.uvwrap_utils import mesh_uv_wrap
-            mesh = mesh_uv_wrap(mesh)
-            self.render.load_mesh(mesh=mesh)
-
-            ########### View Selection #########
-            selected_camera_elevs, selected_camera_azims, selected_view_weights = self.view_processor.bake_view_selection(
-                self.config.candidate_camera_elevs,
-                self.config.candidate_camera_azims,
-                self.config.candidate_view_weights,
-                self.config.max_selected_view_num,
-            )
-
-            normal_maps = self.view_processor.render_normal_multiview(
-                selected_camera_elevs, selected_camera_azims, use_abs_coor=True
-            )
-            position_maps = self.view_processor.render_position_multiview(selected_camera_elevs, selected_camera_azims)
-
-            ##########  Style  ###########
-            image_caption = "high quality"
-            image_style = []
-            for image in image_prompt:
-                image = image.resize((512, 512))
-                if image.mode == "RGBA":
-                    white_bg = Image.new("RGB", image.size, (255, 255, 255))
-                    white_bg.paste(image, mask=image.getchannel("A"))
-                    image = white_bg
-                image_style.append(image)
-            image_style = [image.convert("RGB") for image in image_style]
-
-            ###########  Multiview  ##########
-            multiviews_pbr = self.models["multiview_model"](
-                image_style,
-                normal_maps + position_maps,
-                prompt=image_caption,
-                custom_view_size=self.config.resolution,
-                resize_input=True,
-            )
-            ###########  Enhance  ##########
-            enhance_images = {}
-            enhance_images["albedo"] = copy.deepcopy(multiviews_pbr["albedo"])
-            enhance_images["mr"] = copy.deepcopy(multiviews_pbr["mr"])
-
-            for i in range(len(enhance_images["albedo"])):
-                enhance_images["albedo"][i] = self.models["super_model"](enhance_images["albedo"][i])
-                enhance_images["mr"][i] = self.models["super_model"](enhance_images["mr"][i])
-
-            ###########  Bake  ##########
-            for i in range(len(enhance_images)):
-                enhance_images["albedo"][i] = enhance_images["albedo"][i].resize(
-                    (self.config.render_size, self.config.render_size)
-                )
-                enhance_images["mr"][i] = enhance_images["mr"][i].resize((self.config.render_size, self.config.render_size))
-            texture, mask = self.view_processor.bake_from_multiview(
-                enhance_images["albedo"], selected_camera_elevs, selected_camera_azims, selected_view_weights
-            )
-            mask_np = (mask.squeeze(-1).cpu().numpy() * 255).astype(np.uint8)
-            texture_mr, mask_mr = self.view_processor.bake_from_multiview(
-                enhance_images["mr"], selected_camera_elevs, selected_camera_azims, selected_view_weights
-            )
-            mask_mr_np = (mask_mr.squeeze(-1).cpu().numpy() * 255).astype(np.uint8)
-
-            ##########  inpaint  ###########
-            texture = self.view_processor.texture_inpaint(texture, mask_np)
-            self.render.set_texture(texture, force_set=True)
-            if "mr" in enhance_images:
-                texture_mr = self.view_processor.texture_inpaint(texture_mr, mask_mr_np)
-                self.render.set_texture_mr(texture_mr)
-
-            self.render.save_mesh(output_mesh_path, downsample=True)
-
-            if save_glb:
-                from hy3dpaint.DifferentiableRenderer.mesh_utils import convert_obj_to_glb
-                convert_obj_to_glb(output_mesh_path, output_mesh_path.replace(".obj", ".glb"))
-                output_glb_path = output_mesh_path.replace(".obj", ".glb")
-
-            # Cleanup worker-specific remesh file
-            if use_remesh:
-                try:
-                    if os.path.exists(processed_mesh_path):
-                        os.remove(processed_mesh_path)
-                except:
-                    pass  # Don't fail if cleanup fails
-            
-            return output_mesh_path
-        
-        # Apply the patch
-        Hunyuan3DPaintPipeline.__call__ = patched_call
-        logger.info("✅ Texture generation worker-specific file path patch applied successfully")
-    except ImportError as e:
-        logger.warning(f"⚠️ Could not apply texture generation patch: {e}")
     except Exception as e:
-        logger.warning(f"⚠️ Texture generation patch failed: {e}")
-
+        logger.warning(f"⚠️ Volume decoding patch failed: {e}")
+        
 # Model loading state tracking
 _models_loading_state = {
     'rembg': False,
@@ -566,19 +417,19 @@ class VRAMMonitor:
     def get_available_vram(self) -> float:
         """Get available VRAM in GB (thread-safe)"""
         with self._lock:
-            if not cuda.is_available():
-                return 0.0
-            
-            total = cuda.get_device_properties(0).total_memory / 1024**3
-            allocated = cuda.memory_allocated(0) / 1024**3
-            return total - allocated
+        if not cuda.is_available():
+            return 0.0
+        
+        total = cuda.get_device_properties(0).total_memory / 1024**3
+        allocated = cuda.memory_allocated(0) / 1024**3
+        return total - allocated
     
     def get_used_vram(self) -> float:
         """Get used VRAM in GB (thread-safe)"""
         with self._lock:
-            if not cuda.is_available():
-                return 0.0
-            return cuda.memory_allocated(0) / 1024**3
+        if not cuda.is_available():
+            return 0.0
+        return cuda.memory_allocated(0) / 1024**3
     
     def check_parallel_safety(self, required_per_worker: float, num_workers: int) -> bool:
         """Check if we have enough VRAM for parallel workers"""
@@ -597,8 +448,6 @@ class Predictor(BasePredictor):
         # Apply volume decoding serialization patch for parallel processing safety
         _apply_volume_decoding_patch()
         
-        # Note: texture generation patch is applied after worker models are loaded in _preload_worker_models()
-        
         # Initialize VRAM monitor and cleanup lock for thread safety
         self.vram_monitor = VRAMMonitor()
         self._cleanup_lock = threading.Lock()
@@ -614,10 +463,10 @@ class Predictor(BasePredictor):
     def _cleanup_gpu_memory(self):
         """Thread-safe GPU memory cleanup"""
         with self._cleanup_lock:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()
-                gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+            gc.collect()
             
     # HF-style shape generation function (mimicking their exact pattern)
     def _hf_style_gen_shape(self, image, steps=50, guidance_scale=5.5, seed=1234, 
@@ -1409,10 +1258,6 @@ class Predictor(BasePredictor):
                     worker_models[worker_key]['mesh_simplifier'] = MeshSimplifier()
                     
                     logger.info(f"  ✅ {worker_key} models loaded")
-        
-        # Apply texture generation patch AFTER all worker models are loaded
-        logger.info("🔧 Applying texture generation patch to worker models...")
-        _apply_texture_generation_patch()
         
         logger.info(f"✅ All {num_workers} worker model sets pre-loaded")
 

@@ -12,26 +12,53 @@
 # fine-tuning enabling code and other elements of the foregoing made publicly available
 # by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
 
-import trimesh
+from pathlib import Path
+from uuid import uuid4
 import pymeshlab
+import trimesh
 
 
 def remesh_mesh(mesh_path, remesh_path):
-    mesh = mesh_simplify_trimesh(mesh_path, remesh_path)
+    mesh_simplify_trimesh(mesh_path, remesh_path)
 
 
 def mesh_simplify_trimesh(inputpath, outputpath, target_count=40000):
-    # 先去除离散面
-    ms = pymeshlab.MeshSet()
-    if inputpath.endswith(".glb"):
-        ms.load_new_mesh(inputpath, load_in_a_single_layer=True)
-    else:
-        ms.load_new_mesh(inputpath)
-    ms.save_current_mesh(outputpath.replace(".glb", ".obj"), save_textures=False)
-    # 调用减面函数
-    courent = trimesh.load(outputpath.replace(".glb", ".obj"), force="mesh")
-    face_num = courent.faces.shape[0]
+    """
+    Simplifies a mesh to a target face count, ensuring thread safety for parallel execution.
+    - Creates the output directory if it doesn't exist.
+    - Uses a unique temporary file for intermediate processing to avoid race conditions.
+    - Preserves the original mesh simplification logic using pymeshlab and trimesh.
+    """
+    out_path = Path(outputpath).resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if face_num > target_count:
-        courent = courent.simplify_quadric_decimation(target_count)
-    courent.export(outputpath)
+    # Use a unique temporary path for the intermediate mesh to avoid worker collisions
+    tmp_path = out_path.with_name(f"{out_path.stem}_{uuid4().hex}.obj")
+
+    try:
+        # 1. Load and clean mesh using pymeshlab, saving to a unique temp file
+        ms = pymeshlab.MeshSet()
+        if inputpath.endswith(".glb"):
+            ms.load_new_mesh(inputpath, load_in_a_single_layer=True)
+        else:
+            ms.load_new_mesh(inputpath)
+        ms.save_current_mesh(str(tmp_path), save_textures=False)
+        del ms
+
+        # 2. Load the cleaned mesh in trimesh for simplification
+        courent = trimesh.load(str(tmp_path), force="mesh")
+        face_num = len(courent.faces)
+
+        # 3. Simplify the mesh if it exceeds the target face count
+        if face_num > target_count:
+            courent = courent.simplify_quadric_decimation(target_count)
+
+        # 4. Export the final, simplified mesh to the intended output path
+        courent.export(outputpath)
+        del courent
+
+    finally:
+        # 5. Ensure the temporary file is always deleted
+        tmp_path.unlink(missing_ok=True)
+
+    return outputpath
