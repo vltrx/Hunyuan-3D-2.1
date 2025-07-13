@@ -151,6 +151,10 @@ U2NET_PATH = os.path.join(CHECKPOINTS_PATH, ".u2net/")
 U2NET_URL = "https://weights.replicate.delivery/default/comfy-ui/rembg/u2net.onnx.tar"
 REALESRGAN_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"
 
+# Absolute path to the RealESRGAN checkpoint (robust to CWD changes)
+PROJECT_ROOT = Path(__file__).resolve().parent
+REALESRGAN_CKPT = PROJECT_ROOT / "hy3dpaint" / "ckpt" / "RealESRGAN_x4plus.pth"
+
 # Set U2NET_HOME now that U2NET_PATH is defined
 os.environ["U2NET_HOME"] = U2NET_PATH
 
@@ -206,18 +210,18 @@ def _ensure_texture_model_loaded():
         max_num_view = 6
         resolution = 512
         tex_conf = Hunyuan3DPaintConfig(max_num_view, resolution)
-        tex_conf.realesrgan_ckpt_path = "hy3dpaint/ckpt/RealESRGAN_x4plus.pth"
+        tex_conf.realesrgan_ckpt_path = str(REALESRGAN_CKPT)
         tex_conf.multiview_cfg_path = "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
         tex_conf.custom_pipeline = "hy3dpaint/hunyuanpaintpbr"
 
         # Fallback: Download RealESRGAN model if missing
         if not os.path.exists(tex_conf.realesrgan_ckpt_path):
             logger.info("RealESRGAN model not found, downloading...")
-            os.makedirs(os.path.dirname(tex_conf.realesrgan_ckpt_path), exist_ok=True)
+            os.makedirs(os.path.dirname(REALESRGAN_CKPT), exist_ok=True)
             subprocess.run([
                 "wget", 
-                "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
-                "-O", tex_conf.realesrgan_ckpt_path
+                REALESRGAN_URL,
+                "-O", str(REALESRGAN_CKPT)
             ], check=True)
 
         tex_pipeline = Hunyuan3DPaintPipeline(tex_conf)
@@ -264,7 +268,7 @@ def _ensure_worker_models_loaded():
             max_num_view = 6
             resolution = 512
             tex_conf = Hunyuan3DPaintConfig(max_num_view, resolution)
-            tex_conf.realesrgan_ckpt_path = "hy3dpaint/ckpt/RealESRGAN_x4plus.pth"
+            tex_conf.realesrgan_ckpt_path = str(REALESRGAN_CKPT)
             tex_conf.multiview_cfg_path = "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
             tex_conf.custom_pipeline = "hy3dpaint/hunyuanpaintpbr"
             
@@ -1250,7 +1254,7 @@ class Predictor(BasePredictor):
                     max_num_view = 6
                     resolution = 512
                     tex_conf = Hunyuan3DPaintConfig(max_num_view, resolution)
-                    tex_conf.realesrgan_ckpt_path = "hy3dpaint/ckpt/RealESRGAN_x4plus.pth"
+                    tex_conf.realesrgan_ckpt_path = str(REALESRGAN_CKPT)
                     tex_conf.multiview_cfg_path = "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
                     tex_conf.custom_pipeline = "hy3dpaint/hunyuanpaintpbr"
                     
