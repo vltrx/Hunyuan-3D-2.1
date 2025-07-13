@@ -19,26 +19,21 @@ import pymeshlab
 import trimesh
 
 
-def remesh_mesh(mesh_path: str, output_dir_or_path: str):
-    """Wrapper that creates a unique remesh file to avoid name collisions.
+def remesh_mesh(mesh_path: str, output_dir_path: str):
+    """Create a **unique** remesh filename in the given directory (or the directory part of a path).
 
-    If *output_dir_or_path* is a directory, a unique file is created inside it.
-    If it is a file path, the directory is created (if needed) and the unique
-    name logic is skipped (caller is assumed to have handled uniqueness).
-
-    Returns the final remeshed path.
+    textureGenPipeline historically passes a *file path* like
+    ``/tmp/output/meshes/white_mesh_remesh.obj``.  We ignore the filename and
+    always generate our own UUID-based name to avoid collisions between
+    parallel workers.
     """
-    # Determine if caller passed a directory or full path
-    output_dir_or_path = Path(output_dir_or_path)
+    out_dir = Path(output_dir_path).parent if output_dir_path.endswith(".obj") else Path(output_dir_path)
 
-    if output_dir_or_path.is_dir() or output_dir_or_path.suffix == "":
-        # Treat as directory – create if missing and generate unique file name
-        output_dir_or_path.mkdir(parents=True, exist_ok=True)
-        remesh_path = output_dir_or_path / f"{uuid4().hex}_remesh.obj"
-    else:
-        # Treat as explicit file path – ensure parent dir exists
-        output_dir_or_path.parent.mkdir(parents=True, exist_ok=True)
-        remesh_path = output_dir_or_path
+    # Ensure directory exists
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Always generate a unique OBJ name
+    remesh_path = out_dir / f"{uuid4().hex}_remesh.obj"
 
     mesh_simplify_trimesh(mesh_path, str(remesh_path))
     return str(remesh_path)
