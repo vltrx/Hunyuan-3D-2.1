@@ -105,8 +105,8 @@ class Hunyuan3DPaintPipeline:
         # Process mesh
         path = os.path.dirname(mesh_path)
         if use_remesh:
-            processed_mesh_path = os.path.join(path, "white_mesh_remesh.obj")
-            remesh_mesh(mesh_path, processed_mesh_path)
+            # Pass directory; let remesh_mesh create a unique filename and return the path
+            processed_mesh_path = remesh_mesh(mesh_path, path)
         else:
             processed_mesh_path = mesh_path
 
