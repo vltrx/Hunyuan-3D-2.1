@@ -13,6 +13,7 @@ import gc
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+from threading import Semaphore
 
 import torch
 from PIL import Image
@@ -92,6 +93,9 @@ volume_decoding_lock = threading.Lock()
 
 # Texture generation lock - prevents VRAM overload during parallel texture generation
 texture_generation_lock = threading.Lock()
+
+# Global gate to limit heavy shape generation to 1 GPU at a time
+shape_gpu_gate = Semaphore(1)
 
 # Monkey patch volume decoding to prevent memory collision during parallel processing
 def _patched_latents2mesh(self, latents: torch.FloatTensor, **kwargs):
@@ -782,15 +786,16 @@ class Predictor(BasePredictor):
             generator = torch.Generator()
             generator = generator.manual_seed(int(kwargs.get('seed', 1234)) + image_idx)
             
-            outputs = worker_models_set['shape'](
-                image=processed_image,
-                num_inference_steps=kwargs.get('steps', 50),
-                guidance_scale=kwargs.get('guidance_scale', 5.5),
-                generator=generator,
-                octree_resolution=kwargs.get('octree_resolution', 512),
-                num_chunks=kwargs.get('num_chunks', 200000),
-                output_type='mesh'
-            )
+            with shape_gpu_gate:
+                outputs = worker_models_set['shape'](
+                    image=processed_image,
+                    num_inference_steps=kwargs.get('steps', 50),
+                    guidance_scale=kwargs.get('guidance_scale', 5.5),
+                    generator=generator,
+                    octree_resolution=kwargs.get('octree_resolution', 512),
+                    num_chunks=kwargs.get('num_chunks', 200000),
+                    output_type='mesh'
+                )
             
             # Clean up GPU memory after generation
             self._cleanup_gpu_memory()
@@ -969,14 +974,15 @@ class Predictor(BasePredictor):
             logger.info(f"  Starting shape generation for {image_name}")
             shape_model = _ensure_shape_model_loaded()
             
-            outputs = self._hf_style_gen_shape(
-                processed_image, 
-                kwargs.get('steps', 50),
-                kwargs.get('guidance_scale', 5.5), 
-                kwargs.get('seed', 1234) + image_idx,  # Incremental seed
-                kwargs.get('octree_resolution', 512),
-                kwargs.get('num_chunks', 200000)
-            )
+            with shape_gpu_gate:
+                outputs = self._hf_style_gen_shape(
+                    processed_image, 
+                    kwargs.get('steps', 50),
+                    kwargs.get('guidance_scale', 5.5), 
+                    kwargs.get('seed', 1234) + image_idx,  # Incremental seed
+                    kwargs.get('octree_resolution', 512),
+                    kwargs.get('num_chunks', 200000)
+                )
             
             # Clean up GPU memory after generation
             self._cleanup_gpu_memory()

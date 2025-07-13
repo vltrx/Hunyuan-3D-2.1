@@ -12,14 +12,36 @@
 # fine-tuning enabling code and other elements of the foregoing made publicly available
 # by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
 
+import os
 from pathlib import Path
 from uuid import uuid4
 import pymeshlab
 import trimesh
 
 
-def remesh_mesh(mesh_path, remesh_path):
-    mesh_simplify_trimesh(mesh_path, remesh_path)
+def remesh_mesh(mesh_path: str, output_dir_or_path: str):
+    """Wrapper that creates a unique remesh file to avoid name collisions.
+
+    If *output_dir_or_path* is a directory, a unique file is created inside it.
+    If it is a file path, the directory is created (if needed) and the unique
+    name logic is skipped (caller is assumed to have handled uniqueness).
+
+    Returns the final remeshed path.
+    """
+    # Determine if caller passed a directory or full path
+    output_dir_or_path = Path(output_dir_or_path)
+
+    if output_dir_or_path.is_dir() or output_dir_or_path.suffix == "":
+        # Treat as directory – create if missing and generate unique file name
+        output_dir_or_path.mkdir(parents=True, exist_ok=True)
+        remesh_path = output_dir_or_path / f"{uuid4().hex}_remesh.obj"
+    else:
+        # Treat as explicit file path – ensure parent dir exists
+        output_dir_or_path.parent.mkdir(parents=True, exist_ok=True)
+        remesh_path = output_dir_or_path
+
+    mesh_simplify_trimesh(mesh_path, str(remesh_path))
+    return str(remesh_path)
 
 
 def mesh_simplify_trimesh(inputpath, outputpath, target_count=40000):
