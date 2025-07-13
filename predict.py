@@ -154,6 +154,7 @@ REALESRGAN_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.
 # Absolute path to the RealESRGAN checkpoint (robust to CWD changes)
 PROJECT_ROOT = Path(__file__).resolve().parent
 REALESRGAN_CKPT = PROJECT_ROOT / "hy3dpaint" / "ckpt" / "RealESRGAN_x4plus.pth"
+MULTIVIEW_CFG = PROJECT_ROOT / "hy3dpaint" / "cfgs" / "hunyuan-paint-pbr.yaml"
 
 # Set U2NET_HOME now that U2NET_PATH is defined
 os.environ["U2NET_HOME"] = U2NET_PATH
@@ -211,7 +212,7 @@ def _ensure_texture_model_loaded():
         resolution = 512
         tex_conf = Hunyuan3DPaintConfig(max_num_view, resolution)
         tex_conf.realesrgan_ckpt_path = str(REALESRGAN_CKPT)
-        tex_conf.multiview_cfg_path = "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
+        tex_conf.multiview_cfg_path = str(MULTIVIEW_CFG)
         tex_conf.custom_pipeline = "hy3dpaint/hunyuanpaintpbr"
 
         # Fallback: Download RealESRGAN model if missing
@@ -269,7 +270,7 @@ def _ensure_worker_models_loaded():
             resolution = 512
             tex_conf = Hunyuan3DPaintConfig(max_num_view, resolution)
             tex_conf.realesrgan_ckpt_path = str(REALESRGAN_CKPT)
-            tex_conf.multiview_cfg_path = "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
+            tex_conf.multiview_cfg_path = str(MULTIVIEW_CFG)
             tex_conf.custom_pipeline = "hy3dpaint/hunyuanpaintpbr"
             
             worker_models[thread_id]['texture'] = Hunyuan3DPaintPipeline(tex_conf)
@@ -426,17 +427,17 @@ class VRAMMonitor:
         """Get available VRAM in GB (thread-safe)"""
         with self._lock:
             if not torch.cuda.is_available():
-                return 0.0
+            return 0.0
             device_id = torch.cuda.current_device()
             total = torch.cuda.get_device_properties(device_id).total_memory / 1024**3
             allocated = torch.cuda.memory_allocated(device_id) / 1024**3
-            return total - allocated
+        return total - allocated
     
     def get_used_vram(self) -> float:
         """Get used VRAM in GB (thread-safe)"""
         with self._lock:
             if not torch.cuda.is_available():
-                return 0.0
+            return 0.0
             device_id = torch.cuda.current_device()
             return torch.cuda.memory_allocated(device_id) / 1024**3
 
@@ -471,9 +472,9 @@ class Predictor(BasePredictor):
     def _cleanup_gpu_memory(self):
         """Thread-safe GPU memory cleanup"""
         with self._cleanup_lock:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
             gc.collect()
             
     # HF-style shape generation function (mimicking their exact pattern)
@@ -979,14 +980,14 @@ class Predictor(BasePredictor):
             shape_model = _ensure_shape_model_loaded()
             
             with shape_gpu_gate:
-                outputs = self._hf_style_gen_shape(
-                    processed_image, 
-                    kwargs.get('steps', 50),
-                    kwargs.get('guidance_scale', 5.5), 
-                    kwargs.get('seed', 1234) + image_idx,  # Incremental seed
-                    kwargs.get('octree_resolution', 512),
-                    kwargs.get('num_chunks', 200000)
-                )
+            outputs = self._hf_style_gen_shape(
+                processed_image, 
+                kwargs.get('steps', 50),
+                kwargs.get('guidance_scale', 5.5), 
+                kwargs.get('seed', 1234) + image_idx,  # Incremental seed
+                kwargs.get('octree_resolution', 512),
+                kwargs.get('num_chunks', 200000)
+            )
             
             # Clean up GPU memory after generation
             self._cleanup_gpu_memory()
@@ -1255,7 +1256,7 @@ class Predictor(BasePredictor):
                     resolution = 512
                     tex_conf = Hunyuan3DPaintConfig(max_num_view, resolution)
                     tex_conf.realesrgan_ckpt_path = str(REALESRGAN_CKPT)
-                    tex_conf.multiview_cfg_path = "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
+                    tex_conf.multiview_cfg_path = str(MULTIVIEW_CFG)
                     tex_conf.custom_pipeline = "hy3dpaint/hunyuanpaintpbr"
                     
                     worker_models[worker_key]['texture'] = Hunyuan3DPaintPipeline(tex_conf)
@@ -1343,9 +1344,9 @@ class Predictor(BasePredictor):
         Batch processing mode - extract ZIP, process images, create results
         """
         batch_start_time = time.time()
-
+        
         self._log_analytics_event("predict_mode", {"mode": "batch"})
-
+        
         # ------------------------------------------------------------------
         # Use ABSOLUTE paths so we remain robust even if some library changes
         # the current working directory at runtime (observed in parallel runs)
@@ -1368,13 +1369,13 @@ class Predictor(BasePredictor):
             logger.info(f"Extracted {len(image_paths)} images from ZIP")
         except Exception as e:
             raise ValueError(f"Failed to extract ZIP file: {str(e)}")
-
+        
         if len(image_paths) == 0:
             raise ValueError("No valid images found in ZIP file")
 
         logger.info(f"🚀 Starting batch processing: {len(image_paths)} images")
         logger.info(f"💾 Available VRAM: {self.vram_monitor.get_available_vram():.1f}GB")
-
+        
         # Determine if we can use parallel processing (higher VRAM requirement for dedicated models)
         vram_per_worker = 30.0  # Estimated VRAM per worker with dedicated models (GB)
         can_parallel = (
