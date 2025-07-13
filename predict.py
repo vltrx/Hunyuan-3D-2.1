@@ -975,14 +975,14 @@ class Predictor(BasePredictor):
             shape_model = _ensure_shape_model_loaded()
             
             with shape_gpu_gate:
-            outputs = self._hf_style_gen_shape(
-                processed_image, 
-                kwargs.get('steps', 50),
-                kwargs.get('guidance_scale', 5.5), 
-                kwargs.get('seed', 1234) + image_idx,  # Incremental seed
-                kwargs.get('octree_resolution', 512),
-                kwargs.get('num_chunks', 200000)
-            )
+                outputs = self._hf_style_gen_shape(
+                    processed_image, 
+                    kwargs.get('steps', 50),
+                    kwargs.get('guidance_scale', 5.5), 
+                    kwargs.get('seed', 1234) + image_idx,  # Incremental seed
+                    kwargs.get('octree_resolution', 512),
+                    kwargs.get('num_chunks', 200000)
+                )
             
             # Clean up GPU memory after generation
             self._cleanup_gpu_memory()
