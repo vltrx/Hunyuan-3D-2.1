@@ -413,30 +413,30 @@ def create_batch_zip(meshes_dir: str, results_json_path: str, output_zip_path: s
 class VRAMMonitor:
     def __init__(self):
         self._lock = threading.Lock()
-    
+
     def get_available_vram(self) -> float:
         """Get available VRAM in GB (thread-safe)"""
         with self._lock:
-        if not cuda.is_available():
-            return 0.0
-        
-        total = cuda.get_device_properties(0).total_memory / 1024**3
-        allocated = cuda.memory_allocated(0) / 1024**3
-        return total - allocated
-    
+            if not torch.cuda.is_available():
+                return 0.0
+            device_id = torch.cuda.current_device()
+            total = torch.cuda.get_device_properties(device_id).total_memory / 1024**3
+            allocated = torch.cuda.memory_allocated(device_id) / 1024**3
+            return total - allocated
+
     def get_used_vram(self) -> float:
         """Get used VRAM in GB (thread-safe)"""
         with self._lock:
-        if not cuda.is_available():
-            return 0.0
-        return cuda.memory_allocated(0) / 1024**3
-    
+            if not torch.cuda.is_available():
+                return 0.0
+            device_id = torch.cuda.current_device()
+            return torch.cuda.memory_allocated(device_id) / 1024**3
+
     def check_parallel_safety(self, required_per_worker: float, num_workers: int) -> bool:
         """Check if we have enough VRAM for parallel workers"""
         available = self.get_available_vram()
         total_required = required_per_worker * num_workers
         safety_buffer = 4.0  # 4GB safety buffer
-        
         return available >= (total_required + safety_buffer)
 
 class Predictor(BasePredictor):
@@ -463,9 +463,9 @@ class Predictor(BasePredictor):
     def _cleanup_gpu_memory(self):
         """Thread-safe GPU memory cleanup"""
         with self._cleanup_lock:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
             gc.collect()
             
     # HF-style shape generation function (mimicking their exact pattern)
