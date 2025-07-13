@@ -27,12 +27,18 @@ def remesh_mesh(mesh_path: str, output_dir_path: str):
     always generate our own UUID-based name to avoid collisions between
     parallel workers.
     """
-    out_dir = Path(output_dir_path).parent if output_dir_path.endswith(".obj") else Path(output_dir_path)
+    # Accept either a directory or a full file path and *always* convert to an
+    # absolute directory so that the returned OBJ path is absolute.  This
+    # prevents downstream code that changes cwd from failing to find the file.
+
+    raw_dir = Path(output_dir_path).parent if str(output_dir_path).endswith(".obj") else Path(output_dir_path)
+
+    out_dir = raw_dir.expanduser().resolve()  # <— absolute path
 
     # Ensure directory exists
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Always generate a unique OBJ name
+    # Always generate a unique OBJ name *within* that absolute directory
     remesh_path = out_dir / f"{uuid4().hex}_remesh.obj"
 
     mesh_simplify_trimesh(mesh_path, str(remesh_path))

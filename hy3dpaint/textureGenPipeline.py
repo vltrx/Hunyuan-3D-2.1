@@ -103,12 +103,13 @@ class Hunyuan3DPaintPipeline:
             image_prompt = image_path
 
         # Process mesh (always remesh to guarantee unique path & directory)
-        path = os.path.dirname(mesh_path)
-        processed_mesh_path = remesh_mesh(mesh_path, path)
+        from pathlib import Path
+        mesh_dir = Path(mesh_path).expanduser().resolve().parent  # absolute dir
+        processed_mesh_path = remesh_mesh(mesh_path, str(mesh_dir))
 
         # Output path
         if output_mesh_path is None:
-            output_mesh_path = os.path.join(path, f"textured_mesh.obj")
+            output_mesh_path = os.path.join(str(mesh_dir), "textured_mesh.obj")
 
         # Load mesh
         mesh = trimesh.load(processed_mesh_path)
