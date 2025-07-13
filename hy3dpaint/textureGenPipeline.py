@@ -102,13 +102,9 @@ class Hunyuan3DPaintPipeline:
         else:
             image_prompt = image_path
 
-        # Process mesh
+        # Process mesh (always remesh to guarantee unique path & directory)
         path = os.path.dirname(mesh_path)
-        if use_remesh:
-            # Pass directory; let remesh_mesh create a unique filename and return the path
-            processed_mesh_path = remesh_mesh(mesh_path, path)
-        else:
-            processed_mesh_path = mesh_path
+        processed_mesh_path = remesh_mesh(mesh_path, path)
 
         # Output path
         if output_mesh_path is None:

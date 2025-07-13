@@ -70,7 +70,9 @@ def mesh_simplify_trimesh(inputpath, outputpath, target_count=40000):
         if face_num > target_count:
             courent = courent.simplify_quadric_decimation(target_count)
 
-        # 4. Export the final, simplified mesh to the intended output path
+        # 4. Ensure directory still exists (race-safe) before export
+        Path(outputpath).parent.mkdir(parents=True, exist_ok=True)
+        #    Export the final, simplified mesh
         courent.export(outputpath)
         del courent
 
