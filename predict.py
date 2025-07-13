@@ -18,7 +18,8 @@ from threading import Semaphore
 import torch
 from PIL import Image
 from torch import cuda, Generator
-from cog import BasePredictor, BaseModel, Input, Path
+from cog import BasePredictor, BaseModel, Input, Path  # Path here is for model outputs
+import pathlib
 
 # HuggingFace-style environment setup (from their gradio_app.py)
 def setup_environment():
@@ -152,7 +153,7 @@ U2NET_URL = "https://weights.replicate.delivery/default/comfy-ui/rembg/u2net.onn
 REALESRGAN_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"
 
 # Absolute path to the RealESRGAN checkpoint (robust to CWD changes)
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = pathlib.Path(__file__).resolve().parent
 REALESRGAN_CKPT = PROJECT_ROOT / "hy3dpaint" / "ckpt" / "RealESRGAN_x4plus.pth"
 MULTIVIEW_CFG = PROJECT_ROOT / "hy3dpaint" / "cfgs" / "hunyuan-paint-pbr.yaml"
 
