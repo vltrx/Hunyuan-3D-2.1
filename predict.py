@@ -133,7 +133,7 @@ def _apply_volume_decoding_patch():
         logger.warning(f"⚠️ Could not apply volume decoding patch: {e}")
     except Exception as e:
         logger.warning(f"⚠️ Volume decoding patch failed: {e}")
-        
+
 # Model loading state tracking
 _models_loading_state = {
     'rembg': False,
@@ -422,17 +422,17 @@ class VRAMMonitor:
         """Get available VRAM in GB (thread-safe)"""
         with self._lock:
             if not torch.cuda.is_available():
-                return 0.0
+            return 0.0
             device_id = torch.cuda.current_device()
             total = torch.cuda.get_device_properties(device_id).total_memory / 1024**3
             allocated = torch.cuda.memory_allocated(device_id) / 1024**3
-            return total - allocated
-
+        return total - allocated
+    
     def get_used_vram(self) -> float:
         """Get used VRAM in GB (thread-safe)"""
         with self._lock:
             if not torch.cuda.is_available():
-                return 0.0
+            return 0.0
             device_id = torch.cuda.current_device()
             return torch.cuda.memory_allocated(device_id) / 1024**3
 
@@ -467,9 +467,9 @@ class Predictor(BasePredictor):
     def _cleanup_gpu_memory(self):
         """Thread-safe GPU memory cleanup"""
         with self._cleanup_lock:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
             gc.collect()
             
     # HF-style shape generation function (mimicking their exact pattern)
@@ -975,14 +975,14 @@ class Predictor(BasePredictor):
             shape_model = _ensure_shape_model_loaded()
             
             with shape_gpu_gate:
-                outputs = self._hf_style_gen_shape(
-                    processed_image, 
-                    kwargs.get('steps', 50),
-                    kwargs.get('guidance_scale', 5.5), 
-                    kwargs.get('seed', 1234) + image_idx,  # Incremental seed
-                    kwargs.get('octree_resolution', 512),
-                    kwargs.get('num_chunks', 200000)
-                )
+            outputs = self._hf_style_gen_shape(
+                processed_image, 
+                kwargs.get('steps', 50),
+                kwargs.get('guidance_scale', 5.5), 
+                kwargs.get('seed', 1234) + image_idx,  # Incremental seed
+                kwargs.get('octree_resolution', 512),
+                kwargs.get('num_chunks', 200000)
+            )
             
             # Clean up GPU memory after generation
             self._cleanup_gpu_memory()
@@ -1339,75 +1339,80 @@ class Predictor(BasePredictor):
         Batch processing mode - extract ZIP, process images, create results
         """
         batch_start_time = time.time()
-        
+
         self._log_analytics_event("predict_mode", {"mode": "batch"})
-        
-        # Setup output directory structure
-        if os.path.exists("output"):
-            shutil.rmtree("output")
-        os.makedirs("output", exist_ok=True)
-        os.makedirs("output/meshes", exist_ok=True)
-        
-        # Extract images from ZIP
+
+        # ------------------------------------------------------------------
+        # Use ABSOLUTE paths so we remain robust even if some library changes
+        # the current working directory at runtime (observed in parallel runs)
+        # ------------------------------------------------------------------
+        import pathlib
+        output_root = pathlib.Path("output").resolve()
+        meshes_dir = output_root / "meshes"
+        extracted_dir = output_root / "extracted"
+
+        # Fresh output folder
+        if output_root.exists():
+            shutil.rmtree(output_root)
+        meshes_dir.mkdir(parents=True, exist_ok=True)
+        extracted_dir.mkdir(parents=True, exist_ok=True)
+
+        # Extract images from ZIP ------------------------------------------------
         logger.info("Extracting images from ZIP file...")
-        extract_dir = "output/extracted"
-        os.makedirs(extract_dir, exist_ok=True)
-        
         try:
-            image_paths = extract_zip_images(batch_images, extract_dir)
+            image_paths = extract_zip_images(batch_images, str(extracted_dir))
             logger.info(f"Extracted {len(image_paths)} images from ZIP")
         except Exception as e:
             raise ValueError(f"Failed to extract ZIP file: {str(e)}")
-        
+
         if len(image_paths) == 0:
             raise ValueError("No valid images found in ZIP file")
 
         logger.info(f"🚀 Starting batch processing: {len(image_paths)} images")
         logger.info(f"💾 Available VRAM: {self.vram_monitor.get_available_vram():.1f}GB")
-        
+
         # Determine if we can use parallel processing (higher VRAM requirement for dedicated models)
         vram_per_worker = 30.0  # Estimated VRAM per worker with dedicated models (GB)
         can_parallel = (
-            parallel_workers > 1 and 
+            parallel_workers > 1 and
             len(image_paths) > 1 and
             self.vram_monitor.check_parallel_safety(vram_per_worker, parallel_workers)
         )
-        
+
         if can_parallel:
             logger.info(f"🔥 Using PARALLEL processing with {parallel_workers} workers")
-            batch_results = self._process_batch_parallel(image_paths, parallel_workers, **kwargs)
+            batch_results = self._process_batch_parallel(image_paths, parallel_workers, output_mesh_dir=str(meshes_dir), **kwargs)
         else:
             if parallel_workers > 1:
                 logger.info(f"⚠️  Falling back to SEQUENTIAL processing (insufficient VRAM for {parallel_workers} workers)")
             else:
-                logger.info(f"📋 Using SEQUENTIAL processing")
-            batch_results = self._process_batch_sequential(image_paths, **kwargs)
-        
+                logger.info("📋 Using SEQUENTIAL processing")
+            batch_results = self._process_batch_sequential(image_paths, output_mesh_dir=str(meshes_dir), **kwargs)
+
         # Post-process results to update output mesh paths
         for metadata in batch_results:
             if metadata['status'] == 'success':
                 metadata['output_mesh'] = f"{metadata['input_image']}.glb"
             else:
                 metadata['output_mesh'] = None
-        
-        # Generate batch results JSON
-        results_json_path = "output/batch_results.json"
+
+        # ----------------------- Save results & ZIP -----------------------------
+        results_json_path = output_root / "batch_results.json"
         with open(results_json_path, 'w') as f:
             json.dump(batch_results, f, indent=2)
-        
-        # Create batch ZIP file
-        batch_zip_path = "output/batch_meshes.zip"
-        create_batch_zip("output/meshes", results_json_path, batch_zip_path)
-        
-        # Final statistics
+
+        batch_zip_path = output_root / "batch_meshes.zip"
+        create_batch_zip(str(meshes_dir), str(results_json_path), str(batch_zip_path))
+
+        # Final statistics -------------------------------------------------------
         total_time = time.time() - batch_start_time
         successful_count = len([r for r in batch_results if r['status'] == 'success'])
-        success_rate = successful_count / len(image_paths) * 100
-        
-        logger.info(f"\n🏁 Batch processing completed!")
+        success_rate = successful_count / len(image_paths) * 100 if image_paths else 0
+
+        logger.info("\n🏁 Batch processing completed!")
         logger.info(f"📊 Results: {successful_count}/{len(image_paths)} successful ({success_rate:.1f}%)")
         logger.info(f"⏱️  Total time: {total_time/60:.1f} minutes")
-        
+
         self._log_analytics_event("batch_predict_completed", {
             "total_images": len(image_paths),
             "successful": successful_count,
@@ -1415,14 +1420,23 @@ class Predictor(BasePredictor):
             "success_rate_percent": round(success_rate, 1),
             "total_time_minutes": round(total_time / 60, 1)
         })
-        
+
+        # Use cog.Path for output as expected by Replicate
         return Output(
-            mesh=Path(batch_zip_path),
-            batch_results=Path(results_json_path)
+            mesh=Path(str(batch_zip_path)),
+            batch_results=Path(str(results_json_path))
         )
     
     def _process_batch_parallel(self, image_paths: List[str], parallel_workers: int, **kwargs) -> List[dict]:
         """Process images in parallel using ThreadPoolExecutor with dedicated model instances"""
+        
+        # Extract and remove custom arg
+        import pathlib
+        output_mesh_dir = kwargs.pop('output_mesh_dir', None)
+        if output_mesh_dir is None:
+            output_mesh_dir = str(pathlib.Path("output/meshes").resolve())
+        else:
+            output_mesh_dir = str(pathlib.Path(output_mesh_dir).resolve())
         
         # Pre-load models for all workers before parallel execution
         logger.info(f"🔧 Pre-loading dedicated models for {parallel_workers} workers...")
@@ -1431,7 +1445,7 @@ class Predictor(BasePredictor):
         
         # Prepare arguments for workers (include worker_id for model assignment)
         worker_args = [
-            (idx, image_path, "output/meshes", kwargs, idx % parallel_workers)
+            (idx, image_path, output_mesh_dir, kwargs, idx % parallel_workers)
             for idx, image_path in enumerate(image_paths)
         ]
         
@@ -1503,6 +1517,13 @@ class Predictor(BasePredictor):
     
     def _process_batch_sequential(self, image_paths: List[str], **kwargs) -> List[dict]:
         """Process images sequentially (fallback method)"""
+        import pathlib
+        output_mesh_dir = kwargs.pop('output_mesh_dir', None)
+        if output_mesh_dir is None:
+            output_mesh_dir = str(pathlib.Path("output/meshes").resolve())
+        else:
+            output_mesh_dir = str(pathlib.Path(output_mesh_dir).resolve())
+        
         batch_results = []
         
         for idx, image_path in enumerate(image_paths):
@@ -1535,7 +1556,7 @@ class Predictor(BasePredictor):
             # Process single image
             metadata = self._process_single_image(
                 image_path,
-                "output/meshes",
+                output_mesh_dir,
                 idx,
                 **kwargs
             )
