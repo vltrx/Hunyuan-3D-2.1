@@ -422,17 +422,17 @@ class VRAMMonitor:
         """Get available VRAM in GB (thread-safe)"""
         with self._lock:
             if not torch.cuda.is_available():
-            return 0.0
+                return 0.0
             device_id = torch.cuda.current_device()
             total = torch.cuda.get_device_properties(device_id).total_memory / 1024**3
             allocated = torch.cuda.memory_allocated(device_id) / 1024**3
-        return total - allocated
+            return total - allocated
     
     def get_used_vram(self) -> float:
         """Get used VRAM in GB (thread-safe)"""
         with self._lock:
             if not torch.cuda.is_available():
-            return 0.0
+                return 0.0
             device_id = torch.cuda.current_device()
             return torch.cuda.memory_allocated(device_id) / 1024**3
 
@@ -467,9 +467,9 @@ class Predictor(BasePredictor):
     def _cleanup_gpu_memory(self):
         """Thread-safe GPU memory cleanup"""
         with self._cleanup_lock:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
             gc.collect()
             
     # HF-style shape generation function (mimicking their exact pattern)
