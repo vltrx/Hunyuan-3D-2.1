@@ -29,7 +29,14 @@ class multiviewDiffusionNet:
         self.device = config.device
 
         cfg_path = config.multiview_cfg_path
-        custom_pipeline = config.custom_pipeline
+        # Use local custom pipeline class to avoid remote Hub lookup that can fail when cached
+        try:
+            from hy3dpaint.hunyuanpaintpbr.pipeline import HunyuanPaintPipeline as _LocalPaintPipeline
+            custom_pipeline_cls = _LocalPaintPipeline
+        except Exception:
+            # Fallback to the original string if local import fails
+            custom_pipeline_cls = config.custom_pipeline
+
         cfg = OmegaConf.load(cfg_path)
         self.cfg = cfg
         self.mode = self.cfg.model.params.stable_diffusion_config.custom_pipeline[2:]
@@ -42,8 +49,8 @@ class multiviewDiffusionNet:
         model_path = os.path.join(model_path, "hunyuan3d-paintpbr-v2-1")
         pipeline = DiffusionPipeline.from_pretrained(
             model_path,
-            custom_pipeline=custom_pipeline, 
-            torch_dtype=torch.float16
+            custom_pipeline=custom_pipeline_cls,
+            torch_dtype=torch.float16,
         )
 
         pipeline.scheduler = UniPCMultistepScheduler.from_config(pipeline.scheduler.config, timestep_spacing="trailing")
