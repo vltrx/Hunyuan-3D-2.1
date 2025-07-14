@@ -663,19 +663,21 @@ class Predictor(BasePredictor):
             
             # Post-process mesh with worker-specific models
             logger.info(f"  [Worker-{thread_id}] Post-processing mesh for {image_name}")
-            worker_models = _ensure_worker_models_loaded()
+            # Use a local reference so we don't overwrite the global `worker_models` dict that
+            # stores the pre-loaded per-thread model sets used for parallel execution.
+            worker_models_local = _ensure_worker_models_loaded()
             
             # Apply post-processing pipeline using worker models
-            mesh_output = worker_models['floater_remover'](mesh)
+            mesh_output = worker_models_local['floater_remover'](mesh)
             if mesh_output is None or len(mesh_output.vertices) == 0 or len(mesh_output.faces) == 0:
                 raise RuntimeError("Mesh became empty after floater removal")
                 
-            mesh_output = worker_models['degenerate_remover'](mesh_output)
+            mesh_output = worker_models_local['degenerate_remover'](mesh_output)
             if mesh_output is None or len(mesh_output.vertices) == 0 or len(mesh_output.faces) == 0:
                 raise RuntimeError("Mesh became empty after degenerate face removal")
             
             # Face reduction (always needed)
-            mesh_output = worker_models['face_reducer'](mesh_output, max_facenum=kwargs.get('max_facenum', 40000))
+            mesh_output = worker_models_local['face_reducer'](mesh_output, max_facenum=kwargs.get('max_facenum', 40000))
             if mesh_output is None or len(mesh_output.vertices) == 0 or len(mesh_output.faces) == 0:
                 raise RuntimeError("Mesh became empty after face reduction")
                 
@@ -687,7 +689,7 @@ class Predictor(BasePredictor):
 
             # Apply texturing with worker-specific model
             logger.info(f"  [Worker-{thread_id}] Generating texture for {image_name}")
-            tex_pipeline = worker_models['texture']
+            tex_pipeline = worker_models_local['texture']
             textured_mesh_path = tex_pipeline(
                 mesh_path=temp_mesh_path,
                 image_path=input_image,
