@@ -60,11 +60,11 @@ def mesh_simplify_trimesh(inputpath, outputpath, target_count=40000):
 
     try:
         # 1. Load and clean mesh using pymeshlab, saving to a unique temp file
-    ms = pymeshlab.MeshSet()
-    if inputpath.endswith(".glb"):
-        ms.load_new_mesh(inputpath, load_in_a_single_layer=True)
-    else:
-        ms.load_new_mesh(inputpath)
+        ms = pymeshlab.MeshSet()
+        if inputpath.endswith(".glb"):
+            ms.load_new_mesh(inputpath, load_in_a_single_layer=True)
+        else:
+            ms.load_new_mesh(inputpath)
         ms.save_current_mesh(str(tmp_path), save_textures=False)
         del ms
 
@@ -73,13 +73,12 @@ def mesh_simplify_trimesh(inputpath, outputpath, target_count=40000):
         face_num = len(courent.faces)
 
         # 3. Simplify the mesh if it exceeds the target face count
-    if face_num > target_count:
-        courent = courent.simplify_quadric_decimation(target_count)
+        if face_num > target_count:
+            courent = courent.simplify_quadric_decimation(target_count)
 
-        # 4. Ensure directory still exists (race-safe) before export
+        # 4. Ensure directory still exists (race-safe) before export and save mesh
         Path(outputpath).parent.mkdir(parents=True, exist_ok=True)
-        #    Export the final, simplified mesh
-    courent.export(outputpath)
+        courent.export(outputpath)
         del courent
 
     finally:
