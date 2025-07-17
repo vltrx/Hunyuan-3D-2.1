@@ -20,28 +20,37 @@ import trimesh
 
 
 def remesh_mesh(mesh_path: str, output_dir_path: str):
-    """Create a **unique** remesh filename in the given directory (or the directory part of a path).
-
-    textureGenPipeline historically passes a *file path* like
-    ``/tmp/output/meshes/white_mesh_remesh.obj``.  We ignore the filename and
-    always generate our own UUID-based name to avoid collisions between
-    parallel workers.
+    """Create a **unique** remesh filename in the given directory.
+    
+    Improved version that handles paths more robustly to prevent duplication bugs.
+    
+    Args:
+        mesh_path: Path to the input mesh file  
+        output_dir_path: Directory where the remeshed file should be created
+        
+    Returns:
+        str: Absolute path to the created remesh file
     """
-    # Accept either a directory or a full file path and *always* convert to an
-    # absolute directory so that the returned OBJ path is absolute.  This
-    # prevents downstream code that changes cwd from failing to find the file.
-
-    raw_dir = Path(output_dir_path).parent if str(output_dir_path).endswith(".obj") else Path(output_dir_path)
-
-    out_dir = raw_dir.expanduser().resolve()  # <— absolute path
-
+    # Convert both paths to absolute Path objects for robust handling
+    mesh_path_obj = Path(mesh_path).resolve()
+    
+    # Handle output_dir_path - could be a directory or file path
+    if str(output_dir_path).endswith(".obj"):
+        # If it's a file path, get the parent directory
+        output_dir_obj = Path(output_dir_path).resolve().parent
+    else:
+        # If it's a directory path, use it directly
+        output_dir_obj = Path(output_dir_path).resolve()
+    
     # Ensure directory exists
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Always generate a unique OBJ name *within* that absolute directory
-    remesh_path = out_dir / f"{uuid4().hex}_remesh.obj"
-
-    mesh_simplify_trimesh(mesh_path, str(remesh_path))
+    output_dir_obj.mkdir(parents=True, exist_ok=True)
+    
+    # Generate unique remesh filename to avoid parallel worker collisions
+    remesh_path = output_dir_obj / f"{uuid4().hex}_remesh.obj"
+    
+    # Perform mesh simplification
+    mesh_simplify_trimesh(str(mesh_path_obj), str(remesh_path))
+    
     return str(remesh_path)
 
 

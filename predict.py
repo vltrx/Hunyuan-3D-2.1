@@ -862,6 +862,10 @@ class Predictor(BasePredictor):
             # Create worker-specific temp mesh path to prevent file conflicts
             worker_temp_mesh_path = os.path.join(output_dir, f"{image_name}_worker_{thread_id}_temp.obj")
             
+            # Ensure worker temp mesh path is absolute to prevent texture pipeline path issues
+            import pathlib
+            worker_temp_mesh_path = str(pathlib.Path(worker_temp_mesh_path).resolve())
+            
             # Copy the mesh to worker-specific path to prevent conflicts
             import shutil
             shutil.copy2(temp_mesh_path, worker_temp_mesh_path)
@@ -869,10 +873,12 @@ class Predictor(BasePredictor):
             if available_vram > texture_memory_estimate + 5.0:  # 5GB safety buffer
                 # Sufficient VRAM for parallel texture generation
                 logger.info(f"  [Worker-{thread_id}] Generating texture for {image_name} (PARALLEL - {available_vram:.1f}GB available)")
+                # Ensure absolute path for texture output to prevent path duplication
+                output_textured_path = str(pathlib.Path(os.path.join(output_dir, f"{image_name}_worker_{thread_id}_textured.obj")).resolve())
                 textured_mesh_path = worker_models_set['texture'](
                     mesh_path=worker_temp_mesh_path,
                     image_path=input_image,
-                    output_mesh_path=os.path.join(output_dir, f"{image_name}_worker_{thread_id}_textured.obj")
+                    output_mesh_path=output_textured_path
                 )
                 logger.info(f"  [Worker-{thread_id}] Completed PARALLEL texture generation for {image_name}")
             else:
@@ -880,10 +886,12 @@ class Predictor(BasePredictor):
                 logger.info(f"  [Worker-{thread_id}] Waiting for texture generation slot (VRAM: {available_vram:.1f}GB)")
                 with texture_generation_lock:
                     logger.info(f"  [Worker-{thread_id}] Generating texture for {image_name} (SERIALIZED for VRAM safety)")
+                    # Ensure absolute path for texture output to prevent path duplication
+                    output_textured_path = str(pathlib.Path(os.path.join(output_dir, f"{image_name}_worker_{thread_id}_textured.obj")).resolve())
                     textured_mesh_path = worker_models_set['texture'](
                         mesh_path=worker_temp_mesh_path,
                         image_path=input_image,
-                        output_mesh_path=os.path.join(output_dir, f"{image_name}_worker_{thread_id}_textured.obj")
+                        output_mesh_path=output_textured_path
                     )
                     logger.info(f"  [Worker-{thread_id}] Completed SERIALIZED texture generation for {image_name}")
 

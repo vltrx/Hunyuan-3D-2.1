@@ -102,10 +102,15 @@ class Hunyuan3DPaintPipeline:
         else:
             image_prompt = image_path
 
-        # Process mesh (always remesh to guarantee unique path & directory)
+        # Process mesh with robust path handling to prevent duplication
         from pathlib import Path
-        mesh_dir = Path(mesh_path).expanduser().resolve().parent  # absolute dir
-        processed_mesh_path = remesh_mesh(mesh_path, str(mesh_dir))
+        
+        # Ensure mesh_path is absolute and resolve parent directory correctly
+        mesh_path_obj = Path(mesh_path).resolve()
+        mesh_dir = mesh_path_obj.parent
+        
+        # Pass the original mesh_path and the absolute mesh_dir to remesh_mesh
+        processed_mesh_path = remesh_mesh(str(mesh_path_obj), str(mesh_dir))
 
         # Output path
         if output_mesh_path is None:
