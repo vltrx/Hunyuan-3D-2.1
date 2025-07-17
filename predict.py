@@ -696,11 +696,16 @@ class Predictor(BasePredictor):
                 output_mesh_path=os.path.join(output_dir, f"{image_name}_textured.obj")
             )
 
-            # Export final GLB
+            # Export final GLB with thread-safe filename to prevent parallel processing conflicts
             from trimesh import load as load_trimesh
             final_mesh = load_trimesh(textured_mesh_path)
-            output_path = os.path.join(output_dir, f"{image_name}.glb")
-            final_mesh.export(output_path, include_normals=True)
+            # Ensure completely unique output path to prevent file overwrites during parallel processing
+            unique_output_path = os.path.join(output_dir, f"{image_name}_{thread_id}.glb")
+            final_mesh.export(unique_output_path, include_normals=True)
+            
+            # Rename to final expected filename atomically
+            final_output_path = os.path.join(output_dir, f"{image_name}.glb")
+            os.rename(unique_output_path, final_output_path)
 
             # Update metadata with success
             metadata.update({
@@ -888,11 +893,16 @@ class Predictor(BasePredictor):
             except:
                 pass  # Don't fail if cleanup fails
 
-            # Export final GLB
+            # Export final GLB with thread-safe filename to prevent parallel processing conflicts
             from trimesh import load as load_trimesh
             final_mesh = load_trimesh(textured_mesh_path)
-            output_path = os.path.join(output_dir, f"{image_name}.glb")
-            final_mesh.export(output_path, include_normals=True)
+            # Ensure completely unique output path to prevent file overwrites during parallel processing
+            unique_output_path = os.path.join(output_dir, f"{image_name}_{thread_id}.glb")
+            final_mesh.export(unique_output_path, include_normals=True)
+            
+            # Rename to final expected filename atomically
+            final_output_path = os.path.join(output_dir, f"{image_name}.glb")
+            os.rename(unique_output_path, final_output_path)
 
             # Update metadata with success
             metadata.update({
@@ -1041,11 +1051,17 @@ class Predictor(BasePredictor):
                 output_mesh_path=os.path.join(output_dir, f"{image_name}_textured.obj")
             )
 
-            # Export final GLB
+            # Export final GLB with thread-safe filename to prevent parallel processing conflicts
             from trimesh import load as load_trimesh
             final_mesh = load_trimesh(textured_mesh_path)
-            output_path = os.path.join(output_dir, f"{image_name}.glb")
-            final_mesh.export(output_path, include_normals=True)
+            # Use current thread ID for unique filename in sequential processing
+            thread_id = threading.current_thread().ident
+            unique_output_path = os.path.join(output_dir, f"{image_name}_{thread_id}.glb")
+            final_mesh.export(unique_output_path, include_normals=True)
+            
+            # Rename to final expected filename atomically
+            final_output_path = os.path.join(output_dir, f"{image_name}.glb")
+            os.rename(unique_output_path, final_output_path)
 
             # Update metadata with success
             metadata.update({
