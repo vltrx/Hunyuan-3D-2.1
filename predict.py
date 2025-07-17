@@ -867,7 +867,6 @@ class Predictor(BasePredictor):
             worker_temp_mesh_path = str(pathlib.Path(worker_temp_mesh_path).resolve())
             
             # Robust file copy with validation and retry logic
-            import time
             max_retries = 3
             copy_success = False
             
@@ -897,7 +896,7 @@ class Predictor(BasePredictor):
                 except Exception as e:
                     logger.warning(f"  [Worker-{thread_id}] File copy attempt {attempt + 1} failed: {e}")
                     if attempt < max_retries - 1:
-                        time.sleep(0.1)  # Brief pause before retry
+                        time.sleep(0.1)  # Brief pause before retry (time module already imported at top of file)
                     else:
                         raise RuntimeError(f"Failed to create worker temp mesh file after {max_retries} attempts: {e}")
             
