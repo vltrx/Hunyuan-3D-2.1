@@ -855,7 +855,7 @@ class Predictor(BasePredictor):
                 
                 logger.info(f"  [Worker-{thread_id}] Completed SERIALIZED mesh processing for {image_name}")
 
-            # MEMORY-AWARE texture generation with worker-specific file paths
+            # MEMORY-AWARE texture generation with robust file handling
             available_vram = self.vram_monitor.get_available_vram()
             texture_memory_estimate = 18.0  # GB - conservative estimate for texture generation
             
@@ -866,9 +866,43 @@ class Predictor(BasePredictor):
             import pathlib
             worker_temp_mesh_path = str(pathlib.Path(worker_temp_mesh_path).resolve())
             
-            # Copy the mesh to worker-specific path to prevent conflicts
-            import shutil
-            shutil.copy2(temp_mesh_path, worker_temp_mesh_path)
+            # Robust file copy with validation and retry logic
+            import time
+            max_retries = 3
+            copy_success = False
+            
+            for attempt in range(max_retries):
+                try:
+                    # Validate source file exists and is readable
+                    if not os.path.exists(temp_mesh_path):
+                        raise FileNotFoundError(f"Source mesh file not found: {temp_mesh_path}")
+                    
+                    if os.path.getsize(temp_mesh_path) == 0:
+                        raise ValueError(f"Source mesh file is empty: {temp_mesh_path}")
+                    
+                    # Copy with verification
+                    import shutil
+                    shutil.copy2(temp_mesh_path, worker_temp_mesh_path)
+                    
+                    # Verify copy was successful
+                    if not os.path.exists(worker_temp_mesh_path):
+                        raise FileNotFoundError(f"Worker temp file was not created: {worker_temp_mesh_path}")
+                    
+                    if os.path.getsize(worker_temp_mesh_path) != os.path.getsize(temp_mesh_path):
+                        raise ValueError(f"Worker temp file size mismatch")
+                    
+                    copy_success = True
+                    break
+                    
+                except Exception as e:
+                    logger.warning(f"  [Worker-{thread_id}] File copy attempt {attempt + 1} failed: {e}")
+                    if attempt < max_retries - 1:
+                        time.sleep(0.1)  # Brief pause before retry
+                    else:
+                        raise RuntimeError(f"Failed to create worker temp mesh file after {max_retries} attempts: {e}")
+            
+            if not copy_success:
+                raise RuntimeError("File copy failed after all retry attempts")
             
             if available_vram > texture_memory_estimate + 5.0:  # 5GB safety buffer
                 # Sufficient VRAM for parallel texture generation
