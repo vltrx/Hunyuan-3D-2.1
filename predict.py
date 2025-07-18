@@ -335,139 +335,83 @@ def _aggressive_shape_generation_reset(shape_pipeline):
         logger.info("  🎯 Performing AGGRESSIVE shape generation reset for warmed-up GPU...")
         
         # 1. Reset Diffusion Model State
-        if hasattr(shape_pipeline, 'model'):
-            model = shape_pipeline.model
-            
-            # Clear attention caches in transformer blocks (only if it's a PyTorch module)
-            if hasattr(model, 'named_modules'):
-                for name, module in model.named_modules():
-                    if hasattr(module, '_attention_cache'):
-                        module._attention_cache = None
-                    if hasattr(module, '_key_cache'):
-                        module._key_cache = None
-                    if hasattr(module, '_value_cache'):
-                        module._value_cache = None
-                    if hasattr(module, '_conv_cache'):
-                        module._conv_cache = None
-                    if hasattr(module, '_cached_hidden_states'):
-                        module._cached_hidden_states = None
+        if hasattr(shape_pipeline, 'model') and hasattr(shape_pipeline.model, 'named_modules'):
+            for name, module in shape_pipeline.model.named_modules():
+                for attr in ['_attention_cache', '_key_cache', '_value_cache', '_conv_cache', '_cached_hidden_states']:
+                    if hasattr(module, attr):
+                        setattr(module, attr, None)
         
         # 2. Reset VAE State (critical for geometry contamination)
         if hasattr(shape_pipeline, 'vae'):
             vae = shape_pipeline.vae
-            
-            # Clear encoder/decoder internal state (only if they're PyTorch modules)
             if hasattr(vae, 'encoder') and hasattr(vae.encoder, 'named_modules'):
                 for name, module in vae.encoder.named_modules():
-                    if hasattr(module, '_cached_features'):
-                        module._cached_features = None
-                    if hasattr(module, '_attention_cache'):
-                        module._attention_cache = None
+                    for attr in ['_cached_features', '_attention_cache']:
+                        if hasattr(module, attr):
+                            setattr(module, attr, None)
             
-            if hasattr(vae, 'decoder') or hasattr(vae, 'geo_decoder'):
-                decoder = getattr(vae, 'decoder', None) or getattr(vae, 'geo_decoder', None)
-                if decoder and hasattr(decoder, 'named_modules'):
-                    for name, module in decoder.named_modules():
-                        if hasattr(module, '_cached_features'):
-                            module._cached_features = None
-                        if hasattr(module, '_attention_cache'):
-                            module._attention_cache = None
+            decoder = getattr(vae, 'decoder', None) or getattr(vae, 'geo_decoder', None)
+            if decoder and hasattr(decoder, 'named_modules'):
+                for name, module in decoder.named_modules():
+                    for attr in ['_cached_features', '_attention_cache']:
+                        if hasattr(module, attr):
+                            setattr(module, attr, None)
             
-            # Clear volume decoder state (safely handle non-PyTorch objects)
             if hasattr(vae, 'volume_decoder'):
                 volume_decoder = vae.volume_decoder
                 if hasattr(volume_decoder, 'named_modules'):
-                    # It's a PyTorch module, clear caches normally
                     for name, module in volume_decoder.named_modules():
-                        if hasattr(module, '_cached_volume'):
-                            module._cached_volume = None
-                        if hasattr(module, '_grid_cache'):
-                            module._grid_cache = None
+                        for attr in ['_cached_volume', '_grid_cache']:
+                            if hasattr(module, attr):
+                                setattr(module, attr, None)
                 else:
-                    # It's a custom object (like VanillaVolumeDecoder), clear direct attributes
                     logger.info(f"    🔧 Clearing custom volume decoder: {type(volume_decoder).__name__}")
-                    
-                    # Clear known VanillaVolumeDecoder caches
                     for attr in ['_cached_volume', '_grid_cache', '_volume_cache', '_output_cache', 
-                                '_last_latent', '_cached_geometry', '_cached_features', '_internal_state']:
+                                 '_last_latent', '_cached_geometry', '_cached_features', '_internal_state']:
                         if hasattr(volume_decoder, attr):
                             setattr(volume_decoder, attr, None)
-                            
-                    # Try to clear any tensor attributes that might store previous geometry
-                    for attr_name in dir(volume_decoder):
-                        if not attr_name.startswith('__'):
-                            attr_value = getattr(volume_decoder, attr_name)
-                            import torch
-                            if isinstance(attr_value, torch.Tensor) and attr_value.numel() > 1000:  # Large tensors might be cached geometry
-                                try:
-                                    setattr(volume_decoder, attr_name, None)
-                                    logger.info(f"      🧹 Cleared large tensor attribute: {attr_name}")
-                                except:
-                                    pass
-        
+
         # 3. Reset Conditioner State
-        if hasattr(shape_pipeline, 'conditioner'):
-            conditioner = shape_pipeline.conditioner
-            
-            # Clear image encoder caches (only if it's a PyTorch module)
-            if hasattr(conditioner, 'named_modules'):
-                for name, module in conditioner.named_modules():
-                    if hasattr(module, '_feature_cache'):
-                        module._feature_cache = None
-                    if hasattr(module, '_embedding_cache'):
-                        module._embedding_cache = None
-                    if hasattr(module, 'last_hidden_state'):
-                        module.last_hidden_state = None
+        if hasattr(shape_pipeline, 'conditioner') and hasattr(shape_pipeline.conditioner, 'named_modules'):
+            for name, module in shape_pipeline.conditioner.named_modules():
+                for attr in ['_feature_cache', '_embedding_cache', 'last_hidden_state']:
+                    if hasattr(module, attr):
+                        setattr(module, attr, None)
         
-        # 4. Reset Scheduler State (prevents timestep contamination)
+        # 4. Reset Scheduler State
         if hasattr(shape_pipeline, 'scheduler'):
             scheduler = shape_pipeline.scheduler
-            
-            # Force scheduler reinitialization for warmed-up GPU
             scheduler_class = type(scheduler)
             scheduler_config = scheduler.config if hasattr(scheduler, 'config') else {}
-            
             try:
-                # Create fresh scheduler instance
-                new_scheduler = scheduler_class.from_config(scheduler_config) if scheduler_config else scheduler_class()
-                shape_pipeline.scheduler = new_scheduler
+                shape_pipeline.scheduler = scheduler_class.from_config(scheduler_config) if scheduler_config else scheduler_class()
                 logger.info("  🔄 Forced shape generation scheduler reinitialization")
             except:
-                # Clear scheduler state manually if reinitialization fails
-                if hasattr(scheduler, '_step_index'):
-                    scheduler._step_index = None
-                if hasattr(scheduler, 'model_outputs'):
-                    scheduler.model_outputs = None
-                if hasattr(scheduler, 'sample'):
-                    scheduler.sample = None
+                for attr in ['_step_index', 'model_outputs', 'sample']:
+                    if hasattr(scheduler, attr):
+                        setattr(scheduler, attr, None)
                 logger.warning("  ⚠️ Manual scheduler state clear (reinitialization failed)")
         
-        # 5. COMPREHENSIVE GEOMETRY STATE CLEANUP
-        # Clear any remaining geometry state that could cause contamination
+        # 5. Clear cached trimesh geometry from pipeline object
+        logger.info("    🔍 Deep cleaning shape pipeline for cached trimesh objects...")
         if hasattr(shape_pipeline, '__dict__'):
-            for attr_name, attr_value in list(shape_pipeline.__dict__.items()):
-                import torch
-                if isinstance(attr_value, torch.Tensor):
-                    # Clear any tensor that might contain previous geometry data
-                    if attr_value.numel() > 10000:  # Large tensors likely contain geometry
-                        try:
-                            delattr(shape_pipeline, attr_name)
-                            logger.info(f"      🧹 Cleared pipeline tensor attribute: {attr_name}")
-                        except:
-                            pass
-        
+            for attr in list(shape_pipeline.__dict__.keys()):
+                if 'trimesh' in str(type(getattr(shape_pipeline, attr, None))):
+                    try:
+                        delattr(shape_pipeline, attr)
+                        logger.info(f"      🧹 CRITICAL: Cleared cached trimesh object: {attr}")
+                    except:
+                        pass
+
         # 6. FORCE MEMORY CLEANUP
         import torch
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             import gc
             gc.collect()
-            torch.cuda.empty_cache()
-            
-            # Force synchronization to ensure all operations complete before next use
             torch.cuda.synchronize()
         
-        logger.info("  ✅ AGGRESSIVE shape generation reset completed (geometry contamination prevention)")
+        logger.info("  ✅ AGGRESSIVE shape generation reset completed")
         
     except Exception as e:
         logger.warning(f"  ⚠️ Error during aggressive shape generation reset: {e}")
