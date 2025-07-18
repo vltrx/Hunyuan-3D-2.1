@@ -204,18 +204,64 @@ def _aggressive_gpu_state_reset(tex_pipeline):
             if 'multiview_model' in models and hasattr(models['multiview_model'], 'pipeline'):
                 pipeline = models['multiview_model'].pipeline
                 
-                # Force scheduler reinitialization to clear warmed-up kernel state
+                # ULTRA-AGGRESSIVE scheduler reinitialization for lazy wrapper issues
                 if hasattr(pipeline, 'scheduler'):
                     # Backup scheduler config
                     scheduler_class = type(pipeline.scheduler)
                     scheduler_config = pipeline.scheduler.config if hasattr(pipeline.scheduler, 'config') else {}
                     
-                    # Force new scheduler instance to clear cached GPU kernels
+                    # Force complete scheduler destruction and recreation
                     try:
+                        # Delete old scheduler completely
+                        old_scheduler = pipeline.scheduler
+                        pipeline.scheduler = None
+                        del old_scheduler
+                        
+                        # Force garbage collection
+                        import gc
+                        gc.collect()
+                        
+                        # Clear any PyTorch lazy tensor caches
+                        import torch
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                            # Clear lazy tensor registry if accessible
+                            if hasattr(torch._C, '_clear_lazy_graph'):
+                                try:
+                                    torch._C._clear_lazy_graph()
+                                except:
+                                    pass
+                        
+                        # Create completely fresh scheduler instance
                         pipeline.scheduler = scheduler_class.from_config(scheduler_config) if scheduler_config else scheduler_class()
-                        logger.info("  🔄 Forced scheduler reinitialization")
-                    except:
-                        logger.warning("  ⚠️ Could not reinitialize scheduler")
+                        
+                                                # Ensure scheduler is on the correct device
+                        if hasattr(pipeline.scheduler, 'to') and torch.cuda.is_available():
+                            pipeline.scheduler = pipeline.scheduler.to(torch.cuda.current_device())
+                        
+                        # Special handling for UniPC multistep scheduler (source of lazy wrapper error)
+                        if 'UniPC' in str(type(pipeline.scheduler)):
+                            # Force clear any internal state that could cause lazy wrapper issues
+                            if hasattr(pipeline.scheduler, 'model_outputs'):
+                                pipeline.scheduler.model_outputs = None
+                            if hasattr(pipeline.scheduler, '_step_index'):
+                                pipeline.scheduler._step_index = None
+                            if hasattr(pipeline.scheduler, 'lower_order_nums'):
+                                pipeline.scheduler.lower_order_nums = 0
+                            # Clear any matrix caches that could be corrupted
+                            for attr in ['_R', '_b', '_rhos_c']:
+                                if hasattr(pipeline.scheduler, attr):
+                                    setattr(pipeline.scheduler, attr, None)
+                            logger.info("  🎯 Applied UniPC-specific lazy wrapper fixes")
+                            
+                        logger.info("  🔄 ULTRA-AGGRESSIVE scheduler reinitialization completed")
+                    except Exception as e:
+                        logger.warning(f"  ⚠️ Could not reinitialize scheduler: {e}")
+                        # Fallback to basic reset
+                        try:
+                            pipeline.scheduler = scheduler_class.from_config(scheduler_config) if scheduler_config else scheduler_class()
+                        except:
+                            pass
                 
                 # Clear VAE decoder caches that persist on warmed GPUs
                 if hasattr(pipeline, 'vae'):
@@ -235,7 +281,34 @@ def _aggressive_gpu_state_reset(tex_pipeline):
                         if hasattr(module, '_cached_weights'):
                             module._cached_weights = None
         
-        # 4. FORCE CUDA CONTEXT REFRESH (for warmed-up GPU issues)
+        # 4. AGGRESSIVE PyTorch lazy tensor state clearing
+        try:
+            import torch
+            if torch.cuda.is_available():
+                # Clear any global PyTorch caches that could affect lazy tensors
+                torch.cuda.empty_cache()
+                
+                # Clear autograd computation graph
+                if hasattr(torch.autograd, 'graph'):
+                    try:
+                        torch.autograd.graph.clear()
+                    except:
+                        pass
+                
+                # Force synchronization to ensure all operations complete
+                torch.cuda.synchronize()
+                
+                # Clear compilation caches if using torch.compile
+                if hasattr(torch, '_dynamo'):
+                    try:
+                        torch._dynamo.reset()
+                    except:
+                        pass
+                        
+        except Exception as e:
+            logger.warning(f"  ⚠️ Error during PyTorch state clearing: {e}")
+        
+        # 5. FORCE CUDA CONTEXT REFRESH (for warmed-up GPU issues)
         if torch.cuda.is_available():
             # This is aggressive - forces CUDA to refresh its context
             current_device = torch.cuda.current_device()
