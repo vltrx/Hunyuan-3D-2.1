@@ -260,6 +260,106 @@ def _aggressive_gpu_state_reset(tex_pipeline):
         # Fallback to standard reset
         _comprehensive_texture_pipeline_reset(tex_pipeline)
 
+def _aggressive_shape_generation_reset(shape_pipeline):
+    """Aggressive state reset for shape generation models to prevent geometry contamination."""
+    try:
+        logger.info("  🎯 Performing AGGRESSIVE shape generation reset for warmed-up GPU...")
+        
+        # 1. Reset Diffusion Model State
+        if hasattr(shape_pipeline, 'model'):
+            model = shape_pipeline.model
+            
+            # Clear attention caches in transformer blocks
+            for name, module in model.named_modules():
+                if hasattr(module, '_attention_cache'):
+                    module._attention_cache = None
+                if hasattr(module, '_key_cache'):
+                    module._key_cache = None
+                if hasattr(module, '_value_cache'):
+                    module._value_cache = None
+                if hasattr(module, '_conv_cache'):
+                    module._conv_cache = None
+                if hasattr(module, '_cached_hidden_states'):
+                    module._cached_hidden_states = None
+        
+        # 2. Reset VAE State (critical for geometry contamination)
+        if hasattr(shape_pipeline, 'vae'):
+            vae = shape_pipeline.vae
+            
+            # Clear encoder/decoder internal state
+            if hasattr(vae, 'encoder'):
+                for name, module in vae.encoder.named_modules():
+                    if hasattr(module, '_cached_features'):
+                        module._cached_features = None
+                    if hasattr(module, '_attention_cache'):
+                        module._attention_cache = None
+            
+            if hasattr(vae, 'decoder') or hasattr(vae, 'geo_decoder'):
+                decoder = getattr(vae, 'decoder', None) or getattr(vae, 'geo_decoder', None)
+                if decoder:
+                    for name, module in decoder.named_modules():
+                        if hasattr(module, '_cached_features'):
+                            module._cached_features = None
+                        if hasattr(module, '_attention_cache'):
+                            module._attention_cache = None
+            
+            # Clear volume decoder state
+            if hasattr(vae, 'volume_decoder'):
+                for name, module in vae.volume_decoder.named_modules():
+                    if hasattr(module, '_cached_volume'):
+                        module._cached_volume = None
+                    if hasattr(module, '_grid_cache'):
+                        module._grid_cache = None
+        
+        # 3. Reset Conditioner State
+        if hasattr(shape_pipeline, 'conditioner'):
+            conditioner = shape_pipeline.conditioner
+            
+            # Clear image encoder caches
+            for name, module in conditioner.named_modules():
+                if hasattr(module, '_feature_cache'):
+                    module._feature_cache = None
+                if hasattr(module, '_embedding_cache'):
+                    module._embedding_cache = None
+                if hasattr(module, 'last_hidden_state'):
+                    module.last_hidden_state = None
+        
+        # 4. Reset Scheduler State (prevents timestep contamination)
+        if hasattr(shape_pipeline, 'scheduler'):
+            scheduler = shape_pipeline.scheduler
+            
+            # Force scheduler reinitialization for warmed-up GPU
+            scheduler_class = type(scheduler)
+            scheduler_config = scheduler.config if hasattr(scheduler, 'config') else {}
+            
+            try:
+                # Create fresh scheduler instance
+                new_scheduler = scheduler_class.from_config(scheduler_config) if scheduler_config else scheduler_class()
+                shape_pipeline.scheduler = new_scheduler
+                logger.info("  🔄 Forced shape generation scheduler reinitialization")
+            except:
+                # Clear scheduler state manually if reinitialization fails
+                if hasattr(scheduler, '_step_index'):
+                    scheduler._step_index = None
+                if hasattr(scheduler, 'model_outputs'):
+                    scheduler.model_outputs = None
+                if hasattr(scheduler, 'sample'):
+                    scheduler.sample = None
+                logger.warning("  ⚠️ Manual scheduler state clear (reinitialization failed)")
+        
+        # 5. FORCE MEMORY CLEANUP
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+        
+        logger.info("  ✅ AGGRESSIVE shape generation reset completed")
+        
+    except Exception as e:
+        logger.warning(f"  ⚠️ Error during aggressive shape generation reset: {e}")
+
 class VRAMMonitor:
     """Utility class for thread-safe CUDA VRAM queries."""
 
@@ -794,6 +894,9 @@ class Predictor(BasePredictor):
             logger.info(f"  [Worker-{thread_id}] Starting shape generation for {image_name}")
             shape_worker = _get_worker_model('shape')
             
+            # AGGRESSIVE state cleanup for warmed-up GPU contamination issues
+            _aggressive_shape_generation_reset(shape_worker)
+            
             # Use worker-specific shape generation
             generator = torch.Generator()
             generator = generator.manual_seed(int(kwargs.get('seed', 1234)) + image_idx)
@@ -959,6 +1062,9 @@ class Predictor(BasePredictor):
             
             # Shape generation with worker-specific model
             logger.info(f"  [Worker-{thread_id}] Starting shape generation for {image_name}")
+            
+            # AGGRESSIVE state cleanup for warmed-up GPU contamination issues
+            _aggressive_shape_generation_reset(worker_models_set['shape'])
             
             # Use worker-specific shape generation (no locking!)
             generator = torch.Generator()
@@ -1205,6 +1311,9 @@ class Predictor(BasePredictor):
             # Shape generation with lazy loading
             logger.info(f"  Starting shape generation for {image_name}")
             shape_model = _ensure_shape_model_loaded()
+            
+            # AGGRESSIVE state cleanup for warmed-up GPU contamination issues
+            _aggressive_shape_generation_reset(shape_model)
             
             with shape_gpu_gate:
                 outputs = self._hf_style_gen_shape(
