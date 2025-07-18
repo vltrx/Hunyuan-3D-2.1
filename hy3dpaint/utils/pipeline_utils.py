@@ -17,32 +17,69 @@ import numpy as np
 
 
 class ViewProcessor:
-    def __init__(self, config, render):
+    def __init__(self, config, render=None):
+        """
+        Initialize ViewProcessor with configuration and optional render object.
+        
+        Args:
+            config: Configuration object
+            render: Optional MeshRender object (for backwards compatibility)
+        """
         self.config = config
-        self.render = render
+        self.render = render  # Keep for backwards compatibility
 
-    def render_normal_multiview(self, camera_elevs, camera_azims, use_abs_coor=True):
+    def render_normal_multiview(self, camera_elevs, camera_azims, render=None, use_abs_coor=True):
+        """
+        Render normal maps from multiple viewpoints.
+        
+        Args:
+            camera_elevs: List of elevation angles
+            camera_azims: List of azimuth angles  
+            render: MeshRender object (uses self.render if None)
+            use_abs_coor: Whether to use absolute coordinates
+        """
+        render_obj = render if render is not None else self.render
         normal_maps = []
         for elev, azim in zip(camera_elevs, camera_azims):
-            normal_map = self.render.render_normal(elev, azim, use_abs_coor=use_abs_coor, return_type="pl")
+            normal_map = render_obj.render_normal(elev, azim, use_abs_coor=use_abs_coor, return_type="pl")
             normal_maps.append(normal_map)
 
         return normal_maps
 
-    def render_position_multiview(self, camera_elevs, camera_azims):
+    def render_position_multiview(self, camera_elevs, camera_azims, render=None):
+        """
+        Render position maps from multiple viewpoints.
+        
+        Args:
+            camera_elevs: List of elevation angles
+            camera_azims: List of azimuth angles
+            render: MeshRender object (uses self.render if None)
+        """
+        render_obj = render if render is not None else self.render
         position_maps = []
         for elev, azim in zip(camera_elevs, camera_azims):
-            position_map = self.render.render_position(elev, azim, return_type="pl")
+            position_map = render_obj.render_position(elev, azim, return_type="pl")
             position_maps.append(position_map)
 
         return position_maps
 
     def bake_view_selection(
-        self, candidate_camera_elevs, candidate_camera_azims, candidate_view_weights, max_selected_view_num
+        self, candidate_camera_elevs, candidate_camera_azims, candidate_view_weights, max_selected_view_num, render=None
     ):
+        """
+        Select optimal camera views for texture baking.
+        
+        Args:
+            candidate_camera_elevs: List of candidate elevation angles
+            candidate_camera_azims: List of candidate azimuth angles
+            candidate_view_weights: List of candidate view weights
+            max_selected_view_num: Maximum number of views to select
+            render: MeshRender object (uses self.render if None)
+        """
+        render_obj = render if render is not None else self.render
 
-        original_resolution = self.render.default_resolution
-        self.render.set_default_render_resolution(1024)
+        original_resolution = render_obj.default_resolution
+        render_obj.set_default_render_resolution(1024)
 
         selected_camera_elevs = []
         selected_camera_azims = []
@@ -52,15 +89,15 @@ class ViewProcessor:
         viewed_masks = []
 
         # 计算每个三角片的面积
-        face_areas = self.render.get_face_areas(from_one_index=True)
+        face_areas = render_obj.get_face_areas(from_one_index=True)
         total_area = face_areas.sum()
         face_area_ratios = face_areas / total_area
 
         candidate_view_num = len(candidate_camera_elevs)
-        self.render.set_boundary_unreliable_scale(2)
+        render_obj.set_boundary_unreliable_scale(2)
 
         for elev, azim in zip(candidate_camera_elevs, candidate_camera_azims):
-            viewed_tri_idx = self.render.render_alpha(elev, azim, return_type="np")
+            viewed_tri_idx = render_obj.render_alpha(elev, azim, return_type="np")
             viewed_tri_idxs.append(set(np.unique(viewed_tri_idx.flatten())))
             viewed_masks.append(viewed_tri_idx[0, :, :, 0] > 0)
 
@@ -104,32 +141,53 @@ class ViewProcessor:
             else:
                 break
 
-        self.render.set_default_render_resolution(original_resolution)
+        render_obj.set_default_render_resolution(original_resolution)
 
         return selected_camera_elevs, selected_camera_azims, selected_view_weights
 
-    def bake_from_multiview(self, views, camera_elevs, camera_azims, view_weights):
+    def bake_from_multiview(self, views, camera_elevs, camera_azims, view_weights, render=None):
+        """
+        Bake texture from multiple view images.
+        
+        Args:
+            views: List of view images
+            camera_elevs: List of elevation angles
+            camera_azims: List of azimuth angles
+            view_weights: List of view weights
+            render: MeshRender object (uses self.render if None)
+        """
+        render_obj = render if render is not None else self.render
         project_textures, project_weighted_cos_maps = [], []
         project_boundary_maps = []
 
         for view, camera_elev, camera_azim, weight in zip(views, camera_elevs, camera_azims, view_weights):
-            project_texture, project_cos_map, project_boundary_map = self.render.back_project(
+            project_texture, project_cos_map, project_boundary_map = render_obj.back_project(
                 view, camera_elev, camera_azim
             )
             project_cos_map = weight * (project_cos_map**self.config.bake_exp)
             project_textures.append(project_texture)
             project_weighted_cos_maps.append(project_cos_map)
             project_boundary_maps.append(project_boundary_map)
-            texture, ori_trust_map = self.render.fast_bake_texture(project_textures, project_weighted_cos_maps)
+            texture, ori_trust_map = render_obj.fast_bake_texture(project_textures, project_weighted_cos_maps)
         return texture, ori_trust_map > 1e-8
 
-    def texture_inpaint(self, texture, mask, defualt=None):
+    def texture_inpaint(self, texture, mask, render=None, defualt=None):
+        """
+        Inpaint texture regions using UV connectivity.
+        
+        Args:
+            texture: Input texture tensor
+            mask: Binary mask for inpainting
+            render: MeshRender object (uses self.render if None)
+            defualt: Default value for inpainting (optional)
+        """
+        render_obj = render if render is not None else self.render
         if defualt is not None:
             mask = mask.astype(bool)
             inpaint_value = torch.tensor(defualt, dtype=texture.dtype, device=texture.device)
             texture[~mask] = inpaint_value
         else:
-            texture_np = self.render.uv_inpaint(texture, mask)
+            texture_np = render_obj.uv_inpaint(texture, mask)
             texture = torch.tensor(texture_np / 255).float().to(texture.device)
 
         return texture

@@ -74,13 +74,15 @@ class Hunyuan3DPaintPipeline:
         self.config = config if config is not None else Hunyuan3DPaintConfig()
         self.models = {}
         self.stats_logs = {}
+        # Keep shared render for backwards compatibility, but create new ones for each call
         self.render = MeshRender(
             default_resolution=self.config.render_size,
             texture_size=self.config.texture_size,
             bake_mode=self.config.bake_mode,
             raster_mode=self.config.raster_mode,
         )
-        self.view_processor = ViewProcessor(self.config, self.render)
+        # Pass None to ViewProcessor to make it stateless - render objects will be passed per-call
+        self.view_processor = ViewProcessor(self.config, render=None)
         self.load_models()
 
     def load_models(self):
@@ -92,6 +94,14 @@ class Hunyuan3DPaintPipeline:
     @torch.no_grad()
     def __call__(self, mesh_path=None, image_path=None, output_mesh_path=None, use_remesh=True, save_glb=True):
         """Generate texture for 3D mesh using multiview diffusion"""
+        # Create a new MeshRender instance for this call to ensure thread safety
+        render = MeshRender(
+            default_resolution=self.config.render_size,
+            texture_size=self.config.texture_size,
+            bake_mode=self.config.bake_mode,
+            raster_mode=self.config.raster_mode,
+        )
+        
         # Ensure image_prompt is a list
         if isinstance(image_path, str):
             image_prompt = Image.open(image_path)
@@ -116,15 +126,10 @@ class Hunyuan3DPaintPipeline:
         if output_mesh_path is None:
             output_mesh_path = os.path.join(str(mesh_dir), "textured_mesh.obj")
 
-        # Load mesh
+        # Load mesh into the new render instance
         mesh = trimesh.load(processed_mesh_path)
         mesh = mesh_uv_wrap(mesh)
-
-        # Ensure renderer starts from a completely clean state to avoid geometry carry-over
-        if hasattr(self.render, 'clear_mesh'):
-            self.render.clear_mesh()
-
-        self.render.load_mesh(mesh=mesh)
+        render.load_mesh(mesh=mesh)
 
         ########### View Selection #########
         selected_camera_elevs, selected_camera_azims, selected_view_weights = self.view_processor.bake_view_selection(
@@ -132,12 +137,13 @@ class Hunyuan3DPaintPipeline:
             self.config.candidate_camera_azims,
             self.config.candidate_view_weights,
             self.config.max_selected_view_num,
+            render=render,  # Pass the new render instance
         )
 
         normal_maps = self.view_processor.render_normal_multiview(
-            selected_camera_elevs, selected_camera_azims, use_abs_coor=True
+            selected_camera_elevs, selected_camera_azims, render=render, use_abs_coor=True
         )
-        position_maps = self.view_processor.render_position_multiview(selected_camera_elevs, selected_camera_azims)
+        position_maps = self.view_processor.render_position_multiview(selected_camera_elevs, selected_camera_azims, render=render)
 
         ##########  Style  ###########
         image_caption = "high quality"
@@ -175,22 +181,22 @@ class Hunyuan3DPaintPipeline:
             )
             enhance_images["mr"][i] = enhance_images["mr"][i].resize((self.config.render_size, self.config.render_size))
         texture, mask = self.view_processor.bake_from_multiview(
-            enhance_images["albedo"], selected_camera_elevs, selected_camera_azims, selected_view_weights
+            enhance_images["albedo"], selected_camera_elevs, selected_camera_azims, selected_view_weights, render=render
         )
         mask_np = (mask.squeeze(-1).cpu().numpy() * 255).astype(np.uint8)
         texture_mr, mask_mr = self.view_processor.bake_from_multiview(
-            enhance_images["mr"], selected_camera_elevs, selected_camera_azims, selected_view_weights
+            enhance_images["mr"], selected_camera_elevs, selected_camera_azims, selected_view_weights, render=render
         )
         mask_mr_np = (mask_mr.squeeze(-1).cpu().numpy() * 255).astype(np.uint8)
 
         ##########  inpaint  ###########
-        texture = self.view_processor.texture_inpaint(texture, mask_np)
-        self.render.set_texture(texture, force_set=True)
+        texture = self.view_processor.texture_inpaint(texture, mask_np, render=render)
+        render.set_texture(texture, force_set=True)
         if "mr" in enhance_images:
-            texture_mr = self.view_processor.texture_inpaint(texture_mr, mask_mr_np)
-            self.render.set_texture_mr(texture_mr)
+            texture_mr = self.view_processor.texture_inpaint(texture_mr, mask_mr_np, render=render)
+            render.set_texture_mr(texture_mr)
 
-        self.render.save_mesh(output_mesh_path, downsample=True)
+        render.save_mesh(output_mesh_path, downsample=True)
 
         if save_glb:
             convert_obj_to_glb(output_mesh_path, output_mesh_path.replace(".obj", ".glb"))
