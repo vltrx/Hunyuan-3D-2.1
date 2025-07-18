@@ -119,6 +119,11 @@ class Hunyuan3DPaintPipeline:
         # Load mesh
         mesh = trimesh.load(processed_mesh_path)
         mesh = mesh_uv_wrap(mesh)
+
+        # Ensure renderer starts from a completely clean state to avoid geometry carry-over
+        if hasattr(self.render, 'clear_mesh'):
+            self.render.clear_mesh()
+
         self.render.load_mesh(mesh=mesh)
 
         ########### View Selection #########
