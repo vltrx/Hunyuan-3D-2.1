@@ -338,25 +338,26 @@ def _aggressive_shape_generation_reset(shape_pipeline):
         if hasattr(shape_pipeline, 'model'):
             model = shape_pipeline.model
             
-            # Clear attention caches in transformer blocks
-            for name, module in model.named_modules():
-                if hasattr(module, '_attention_cache'):
-                    module._attention_cache = None
-                if hasattr(module, '_key_cache'):
-                    module._key_cache = None
-                if hasattr(module, '_value_cache'):
-                    module._value_cache = None
-                if hasattr(module, '_conv_cache'):
-                    module._conv_cache = None
-                if hasattr(module, '_cached_hidden_states'):
-                    module._cached_hidden_states = None
+            # Clear attention caches in transformer blocks (only if it's a PyTorch module)
+            if hasattr(model, 'named_modules'):
+                for name, module in model.named_modules():
+                    if hasattr(module, '_attention_cache'):
+                        module._attention_cache = None
+                    if hasattr(module, '_key_cache'):
+                        module._key_cache = None
+                    if hasattr(module, '_value_cache'):
+                        module._value_cache = None
+                    if hasattr(module, '_conv_cache'):
+                        module._conv_cache = None
+                    if hasattr(module, '_cached_hidden_states'):
+                        module._cached_hidden_states = None
         
         # 2. Reset VAE State (critical for geometry contamination)
         if hasattr(shape_pipeline, 'vae'):
             vae = shape_pipeline.vae
             
-            # Clear encoder/decoder internal state
-            if hasattr(vae, 'encoder'):
+            # Clear encoder/decoder internal state (only if they're PyTorch modules)
+            if hasattr(vae, 'encoder') and hasattr(vae.encoder, 'named_modules'):
                 for name, module in vae.encoder.named_modules():
                     if hasattr(module, '_cached_features'):
                         module._cached_features = None
@@ -365,33 +366,58 @@ def _aggressive_shape_generation_reset(shape_pipeline):
             
             if hasattr(vae, 'decoder') or hasattr(vae, 'geo_decoder'):
                 decoder = getattr(vae, 'decoder', None) or getattr(vae, 'geo_decoder', None)
-                if decoder:
+                if decoder and hasattr(decoder, 'named_modules'):
                     for name, module in decoder.named_modules():
                         if hasattr(module, '_cached_features'):
                             module._cached_features = None
                         if hasattr(module, '_attention_cache'):
                             module._attention_cache = None
             
-            # Clear volume decoder state
+            # Clear volume decoder state (safely handle non-PyTorch objects)
             if hasattr(vae, 'volume_decoder'):
-                for name, module in vae.volume_decoder.named_modules():
-                    if hasattr(module, '_cached_volume'):
-                        module._cached_volume = None
-                    if hasattr(module, '_grid_cache'):
-                        module._grid_cache = None
+                volume_decoder = vae.volume_decoder
+                if hasattr(volume_decoder, 'named_modules'):
+                    # It's a PyTorch module, clear caches normally
+                    for name, module in volume_decoder.named_modules():
+                        if hasattr(module, '_cached_volume'):
+                            module._cached_volume = None
+                        if hasattr(module, '_grid_cache'):
+                            module._grid_cache = None
+                else:
+                    # It's a custom object (like VanillaVolumeDecoder), clear direct attributes
+                    logger.info(f"    🔧 Clearing custom volume decoder: {type(volume_decoder).__name__}")
+                    
+                    # Clear known VanillaVolumeDecoder caches
+                    for attr in ['_cached_volume', '_grid_cache', '_volume_cache', '_output_cache', 
+                                '_last_latent', '_cached_geometry', '_cached_features', '_internal_state']:
+                        if hasattr(volume_decoder, attr):
+                            setattr(volume_decoder, attr, None)
+                            
+                    # Try to clear any tensor attributes that might store previous geometry
+                    for attr_name in dir(volume_decoder):
+                        if not attr_name.startswith('__'):
+                            attr_value = getattr(volume_decoder, attr_name)
+                            import torch
+                            if isinstance(attr_value, torch.Tensor) and attr_value.numel() > 1000:  # Large tensors might be cached geometry
+                                try:
+                                    setattr(volume_decoder, attr_name, None)
+                                    logger.info(f"      🧹 Cleared large tensor attribute: {attr_name}")
+                                except:
+                                    pass
         
         # 3. Reset Conditioner State
         if hasattr(shape_pipeline, 'conditioner'):
             conditioner = shape_pipeline.conditioner
             
-            # Clear image encoder caches
-            for name, module in conditioner.named_modules():
-                if hasattr(module, '_feature_cache'):
-                    module._feature_cache = None
-                if hasattr(module, '_embedding_cache'):
-                    module._embedding_cache = None
-                if hasattr(module, 'last_hidden_state'):
-                    module.last_hidden_state = None
+            # Clear image encoder caches (only if it's a PyTorch module)
+            if hasattr(conditioner, 'named_modules'):
+                for name, module in conditioner.named_modules():
+                    if hasattr(module, '_feature_cache'):
+                        module._feature_cache = None
+                    if hasattr(module, '_embedding_cache'):
+                        module._embedding_cache = None
+                    if hasattr(module, 'last_hidden_state'):
+                        module.last_hidden_state = None
         
         # 4. Reset Scheduler State (prevents timestep contamination)
         if hasattr(shape_pipeline, 'scheduler'):
@@ -416,15 +442,32 @@ def _aggressive_shape_generation_reset(shape_pipeline):
                     scheduler.sample = None
                 logger.warning("  ⚠️ Manual scheduler state clear (reinitialization failed)")
         
-        # 5. FORCE MEMORY CLEANUP
+        # 5. COMPREHENSIVE GEOMETRY STATE CLEANUP
+        # Clear any remaining geometry state that could cause contamination
+        if hasattr(shape_pipeline, '__dict__'):
+            for attr_name, attr_value in list(shape_pipeline.__dict__.items()):
+                import torch
+                if isinstance(attr_value, torch.Tensor):
+                    # Clear any tensor that might contain previous geometry data
+                    if attr_value.numel() > 10000:  # Large tensors likely contain geometry
+                        try:
+                            delattr(shape_pipeline, attr_name)
+                            logger.info(f"      🧹 Cleared pipeline tensor attribute: {attr_name}")
+                        except:
+                            pass
+        
+        # 6. FORCE MEMORY CLEANUP
         import torch
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             import gc
             gc.collect()
             torch.cuda.empty_cache()
+            
+            # Force synchronization to ensure all operations complete before next use
+            torch.cuda.synchronize()
         
-        logger.info("  ✅ AGGRESSIVE shape generation reset completed")
+        logger.info("  ✅ AGGRESSIVE shape generation reset completed (geometry contamination prevention)")
         
     except Exception as e:
         logger.warning(f"  ⚠️ Error during aggressive shape generation reset: {e}")
