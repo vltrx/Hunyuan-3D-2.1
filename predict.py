@@ -23,6 +23,7 @@ from PIL import Image
 from torch import cuda, Generator
 from cog import BasePredictor, BaseModel, Input, Path  # Path here is for model outputs
 import pathlib
+from queue import Queue
 
 # HuggingFace-style environment setup (from their gradio_app.py)
 def setup_environment():
@@ -1629,88 +1630,76 @@ class Predictor(BasePredictor):
             raise
 
     def _preload_worker_models(self, num_workers: int):
-        """Pre-load model instances for all workers with predictable IDs"""
+        global worker_models, worker_model_pool
         logger.info(f"🔧 Pre-loading models for {num_workers} workers...")
         
-        # Pre-load models sequentially but assign to predictable worker IDs
-        for worker_id in range(num_workers):
-            worker_key = f"worker_{worker_id}"
+        worker_model_pool = Queue(maxsize=num_workers)
+
+        for i in range(num_workers):
+            worker_key = f"worker_{i}"
             logger.info(f"  Loading models for {worker_key}...")
+            # ... existing code ...
             
-            with worker_models_lock:
-                if worker_key not in worker_models:
-                    # Initialize worker model storage
-                    worker_models[worker_key] = {}
-                    
-                    # Load background removal model
-                    logger.info(f"    Loading BackgroundRemover for {worker_key}...")
-                    worker_models[worker_key]['rembg'] = BackgroundRemover()
-                    
-                    # Load shape generation model 
-                    logger.info(f"    Loading Hunyuan3D shape model for {worker_key}...")
-                    worker_models[worker_key]['shape'] = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
-                        "tencent/Hunyuan3D-2.1"
-                    )
-                    
-                    # Load texture generation model
-                    logger.info(f"    Loading texture generation model for {worker_key}...")
-                    max_num_view = 6
-                    resolution = 512
-                    tex_conf = Hunyuan3DPaintConfig(max_num_view, resolution)
-                    tex_conf.realesrgan_ckpt_path = str(REALESRGAN_CKPT)
-                    tex_conf.multiview_cfg_path = str(MULTIVIEW_CFG)
-                    tex_conf.custom_pipeline = "hy3dpaint/hunyuanpaintpbr"
-                    
-                    worker_models[worker_key]['texture'] = Hunyuan3DPaintPipeline(tex_conf)
-                    
-                    # Load post-processing tools
-                    logger.info(f"    Loading mesh processing tools for {worker_key}...")
-                    worker_models[worker_key]['floater_remover'] = FloaterRemover()
-                    worker_models[worker_key]['degenerate_remover'] = DegenerateFaceRemover()
-                    worker_models[worker_key]['face_reducer'] = FaceReducer()
-                    worker_models[worker_key]['mesh_simplifier'] = MeshSimplifier()
-                    
-                    logger.info(f"  ✅ {worker_key} models loaded")
-        
-        logger.info(f"✅ All {num_workers} worker model sets pre-loaded")
+            worker_models[worker_key] = worker_set
+            worker_model_pool.put(worker_key) # Add the worker key to the pool
+            logger.info(f"  ✅ {worker_key} models loaded and added to the pool")
+
+        logger.info(f"✅ All {num_workers} worker model sets pre-loaded and pooled")
 
     def _cleanup_all_worker_models(self):
-        """Clean up all pre-loaded worker model instances"""
+        global worker_models, worker_model_pool
+        if not worker_models:
+            return
+        
         logger.info("🧹 Cleaning up all pre-loaded worker models...")
-        with worker_models_lock:
-            worker_keys = list(worker_models.keys())
-            for worker_key in worker_keys:
-                if worker_key.startswith('worker_'):
-                    logger.info(f"  Cleaning up {worker_key} models...")
-                    del worker_models[worker_key]
+        # ... existing code ...
+        worker_models = {}
+        worker_model_pool = None
         logger.info("✅ All pre-loaded worker models cleaned up")
 
 
 
     def _process_image_worker(self, args_tuple):
-        """
-        Worker function for parallel processing.
-        Acquires a worker from the queue, processes one image, and releases the worker.
-        """
-        image_path, output_dir, image_idx, worker_queue, kwargs = args_tuple
+        """Wrapper function to be used by the thread pool executor."""
         
         worker_key = None
         try:
-            # Get a worker from the queue (blocks until one is available)
-            worker_key = worker_queue.get()
+            # Check out a worker model set from the pool
+            # This will block until a worker is available
+            worker_key = worker_model_pool.get(timeout=600) # 10 minute timeout
+            logger.info(f"  [Thread-{threading.get_ident()}] Checked out {worker_key}")
+
+            # Unpack arguments
+            image_input, output_dir, image_idx, kwargs = args_tuple
             
-            # Process the image using the assigned worker
+            # The core processing logic
             return self._process_single_image_worker_direct(
-                image_input=image_path,
-                output_dir=output_dir,
-                image_idx=image_idx,
-                worker_key=worker_key,
+                image_input, 
+                output_dir, 
+                image_idx, 
+                worker_key, 
                 **kwargs
             )
+        except Exception as e:
+            # Handle exceptions, including queue timeout
+            thread_id = threading.get_ident()
+            image_name = Path(args_tuple[0]).stem
+            logger.error(f"  [Thread-{thread_id}] Exception processing {image_name}: {e}")
+            return {
+                "input_image": image_name,
+                "output_mesh": None,
+                "status": "error",
+                "duration": 0,
+                "face_count": 0,
+                "vertex_count": 0,
+                "error": str(e),
+                "error_type": type(e).__name__
+            }
         finally:
-            # IMPORTANT: Return the worker to the queue so it can be reused
-            if worker_key is not None:
-                worker_queue.put(worker_key)
+            # CRITICAL: Always return the worker key to the pool
+            if worker_key:
+                worker_model_pool.put(worker_key)
+                logger.info(f"  [Thread-{threading.get_ident()}] Returned {worker_key} to pool")
 
     def _process_batch_parallel(self, image_paths: List[str], parallel_workers: int, **kwargs) -> List[dict]:
         """Process a batch of images in parallel using a thread pool."""
@@ -1718,22 +1707,14 @@ class Predictor(BasePredictor):
         vram_before = self.vram_monitor.get_available_vram()
         logger.info(f"💾 VRAM before batch: {vram_before:.1f}GB")
 
-        # Use a thread pool to manage worker execution
+        # Prepare arguments for each image processing task
+        args_list = [(path, os.path.join(self.output_dir, "meshes"), i, kwargs) for i, path in enumerate(image_paths)]
+
+        # Use a ThreadPoolExecutor to manage parallel execution
         with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
-            
-            # The worker_key is now managed by the queue, not assigned directly
-            args_list = [(
-                image_path, 
-                kwargs.get('output_mesh_dir', os.path.join(self.output_dir, "meshes")),
-                i,
-                self.worker_queue, # Pass the queue to the worker
-                kwargs
-            ) for i, image_path in enumerate(image_paths)]
-            
-            # Map jobs to threads and collect results
-            results = list(tqdm(executor.map(self._process_image_worker, args_list), 
-                                total=len(image_paths), desc="Batch Processing"))
-        
+            # map() blocks until all tasks are complete
+            results = list(executor.map(self._process_image_worker, args_list))
+
         return results
 
     def _initialize_worker_pool(self, num_workers: int):
