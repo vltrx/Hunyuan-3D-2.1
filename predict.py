@@ -14,6 +14,9 @@ import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 from threading import Semaphore
+import tempfile
+import queue
+from tqdm import tqdm
 
 import torch
 from PIL import Image
@@ -1692,240 +1695,138 @@ class Predictor(BasePredictor):
 
 
     def _process_image_worker(self, args_tuple):
-        """Worker function for parallel image processing with pre-loaded models"""
-        idx, image_path, output_dir, kwargs, worker_id = args_tuple
+        """
+        Worker function for parallel processing.
+        Acquires a worker from the queue, processes one image, and releases the worker.
+        """
+        image_path, output_dir, image_idx, worker_queue, kwargs = args_tuple
         
-        # Each worker gets its own thread ID for logging
-        thread_id = threading.current_thread().ident
-        image_name = os.path.splitext(os.path.basename(image_path))[0]
-        worker_key = f"worker_{worker_id}"
-        
-        logger.info(f"🔄 [Worker-{thread_id}] Processing {image_name} ({idx + 1}) using {worker_key} models")
-        
+        worker_key = None
         try:
-            # Pre-processing VRAM check for this worker
-            current_vram = self.vram_monitor.get_available_vram()
-            logger.info(f"  [Worker-{thread_id}] VRAM: {current_vram:.1f}GB available")
+            # Get a worker from the queue (blocks until one is available)
+            worker_key = worker_queue.get()
             
-            if current_vram < 25.0:  # Require 25GB per worker for dedicated models
-                raise RuntimeError(f"Insufficient VRAM for worker: {current_vram:.1f}GB available")
-            
-            # Verify pre-loaded models are available
-            if worker_key not in worker_models:
-                raise RuntimeError(f"Pre-loaded models not found for {worker_key}")
-            
-            # Process the image using pre-loaded worker-specific models
-            metadata = self._process_single_image_worker_direct(
-                image_path,
-                output_dir,
-                idx,
-                worker_key,
+            # Process the image using the assigned worker
+            return self._process_single_image_worker_direct(
+                image_input=image_path,
+                output_dir=output_dir,
+                image_idx=image_idx,
+                worker_key=worker_key,
                 **kwargs
             )
-            
-            logger.info(f"✅ [Worker-{thread_id}] Completed {image_name}")
-            return metadata
-            
-        except Exception as e:
-            logger.error(f"❌ [Worker-{thread_id}] Failed {image_name}: {str(e)}")
-            
-            # Return error metadata
-            return {
-                "input_image": image_name,
-                "output_mesh": None,
-                "status": "error",
-                "duration": 0.0,
-                "face_count": 0,
-                "vertex_count": 0,
-                "error": str(e),
-                "error_type": type(e).__name__
-            }
         finally:
-            # Always cleanup after worker
-            self._cleanup_gpu_memory()
-            # Don't cleanup worker models here - they're shared/pre-loaded
+            # IMPORTANT: Return the worker to the queue so it can be reused
+            if worker_key is not None:
+                worker_queue.put(worker_key)
+
+    def _process_batch_parallel(self, image_paths: List[str], parallel_workers: int, **kwargs) -> List[dict]:
+        """Process a batch of images in parallel using a thread pool."""
+        logger.info(f"🔄 Processing batch 1: images 1-{len(image_paths)}")
+        vram_before = self.vram_monitor.get_available_vram()
+        logger.info(f"💾 VRAM before batch: {vram_before:.1f}GB")
+
+        # Use a thread pool to manage worker execution
+        with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
+            
+            # The worker_key is now managed by the queue, not assigned directly
+            args_list = [(
+                image_path, 
+                kwargs.get('output_mesh_dir', os.path.join(self.output_dir, "meshes")),
+                i,
+                self.worker_queue, # Pass the queue to the worker
+                kwargs
+            ) for i, image_path in enumerate(image_paths)]
+            
+            # Map jobs to threads and collect results
+            results = list(tqdm(executor.map(self._process_image_worker, args_list), 
+                                total=len(image_paths), desc="Batch Processing"))
+        
+        return results
+
+    def _initialize_worker_pool(self, num_workers: int):
+        """Initializes the stateful worker pool for thread-safe processing."""
+        logger.info(f"  🏭 Initializing stateful worker pool with {num_workers} workers...")
+        self.worker_locks = {f"worker_{i}": threading.Lock() for i in range(num_workers)}
+        self.worker_queue = queue.Queue()
+        for i in range(num_workers):
+            self.worker_queue.put(f"worker_{i}")
+        logger.info("  ✅ Worker pool initialized.")
 
     def _predict_batch(self, batch_images: Path, parallel_workers: int = 2, **kwargs) -> Output:
         """
-        Batch processing mode - extract ZIP, process images, create results
+        Process a batch of images from a ZIP file.
+        This is the main entry point for batch prediction.
         """
-        batch_start_time = time.time()
+        # Determine number of workers
+        if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
+            parallel_workers = 1
         
-        self._log_analytics_event("predict_mode", {"mode": "batch"})
+        self.active_workers = parallel_workers
         
-        # ------------------------------------------------------------------
-        # Use ABSOLUTE paths so we remain robust even if some library changes
-        # the current working directory at runtime (observed in parallel runs)
-        # ------------------------------------------------------------------
-        import pathlib
-        output_root = pathlib.Path("output").resolve()
-        meshes_dir = output_root / "meshes"
-        extracted_dir = output_root / "extracted"
-
-        # Fresh output folder
-        if output_root.exists():
-            shutil.rmtree(output_root)
-        meshes_dir.mkdir(parents=True, exist_ok=True)
-        extracted_dir.mkdir(parents=True, exist_ok=True)
-
-        # Extract images from ZIP ------------------------------------------------
-        logger.info("Extracting images from ZIP file...")
-        try:
-            image_paths = extract_zip_images(batch_images, str(extracted_dir))
-            logger.info(f"Extracted {len(image_paths)} images from ZIP")
-        except Exception as e:
-            raise ValueError(f"Failed to extract ZIP file: {str(e)}")
+        # Initialize the stateful worker pool
+        self._initialize_worker_pool(self.active_workers)
         
-        if len(image_paths) == 0:
-            raise ValueError("No valid images found in ZIP file")
-
-        logger.info(f"🚀 Starting batch processing: {len(image_paths)} images")
-        logger.info(f"💾 Available VRAM: {self.vram_monitor.get_available_vram():.1f}GB")
+        results_dir = tempfile.mkdtemp()
+        meshes_dir = os.path.join(results_dir, "meshes")
+        os.makedirs(meshes_dir, exist_ok=True)
         
-        # Determine if we can use parallel processing (higher VRAM requirement for dedicated models)
-        vram_per_worker = 30.0  # Estimated VRAM per worker with dedicated models (GB)
-        can_parallel = (
-            parallel_workers > 1 and
-            len(image_paths) > 1 and
-            self.vram_monitor.check_parallel_safety(vram_per_worker, parallel_workers)
-        )
-
-        if can_parallel:
-            logger.info(f"🔥 Using PARALLEL processing with {parallel_workers} workers")
-            batch_results = self._process_batch_parallel(image_paths, parallel_workers, output_mesh_dir=str(meshes_dir), **kwargs)
+        # Pre-load models in parallel for all workers
+        if self.active_workers > 1:
+            self._preload_worker_models(self.active_workers)
+        
+        image_paths = extract_zip_images(batch_images, self.output_dir)
+        num_images = len(image_paths)
+        logger.info(f"🚀 Starting batch processing: {num_images} images")
+        
+        # Log VRAM and processing mode
+        self.vram_monitor.get_available_vram()
+        if self.active_workers > 1:
+            logger.info(f"🔥 Using PARALLEL processing with {self.active_workers} workers")
         else:
-            if parallel_workers > 1:
-                logger.info(f"⚠️  Falling back to SEQUENTIAL processing (insufficient VRAM for {parallel_workers} workers)")
-            else:
-                logger.info("📋 Using SEQUENTIAL processing")
-            batch_results = self._process_batch_sequential(image_paths, output_mesh_dir=str(meshes_dir), **kwargs)
+            logger.info(f"🔥 Using SEQUENTIAL processing (CPU or single GPU)")
+        
+        start_time = time.time()
+        
+        # Choose processing strategy based on number of workers
+        if self.active_workers > 1:
+            all_results = self._process_batch_parallel(image_paths, self.active_workers, **kwargs)
+        else:
+            all_results = self._process_batch_sequential(image_paths, **kwargs)
+        
+        end_time = time.time()
+        
+        # Final cleanup of pre-loaded models
+        if self.active_workers > 1:
+            self._cleanup_all_worker_models()
+        
+        total_time = end_time - start_time
+        
+        # Create final results zip
+        results_json_path = os.path.join(results_dir, "results.json")
+        with open(results_json_path, "w") as f:
+            json.dump(all_results, f, indent=2)
+            
+        successful_predictions = [res for res in all_results if res['status'] == 'success']
+        output_zip_path = os.path.join(self.output_dir, "batch_results.zip")
+        create_batch_zip(meshes_dir, results_json_path, output_zip_path)
 
-        # Post-process results to update output mesh paths
-        for metadata in batch_results:
-            if metadata['status'] == 'success':
-                metadata['output_mesh'] = f"{metadata['input_image']}.glb"
-            else:
-                metadata['output_mesh'] = None
-
-        # ----------------------- Save results & ZIP -----------------------------
-        results_json_path = output_root / "batch_results.json"
-        with open(results_json_path, 'w') as f:
-            json.dump(batch_results, f, indent=2)
-
-        batch_zip_path = output_root / "batch_meshes.zip"
-        create_batch_zip(str(meshes_dir), str(results_json_path), str(batch_zip_path))
-
-        # Final statistics -------------------------------------------------------
-        total_time = time.time() - batch_start_time
-        successful_count = len([r for r in batch_results if r['status'] == 'success'])
-        success_rate = successful_count / len(image_paths) * 100 if image_paths else 0
-
+        # Log analytics
+        success_rate = (len(successful_predictions) / num_images) * 100 if num_images > 0 else 0
+        analytics_data = {
+            'total_images': num_images,
+            'successful': len(successful_predictions),
+            'failed': num_images - len(successful_predictions),
+            'success_rate_percent': round(success_rate, 1),
+            'total_time_minutes': round(total_time / 60, 1)
+        }
+        self._log_analytics_event("batch_predict_completed", analytics_data)
+        
         logger.info("\n🏁 Batch processing completed!")
-        logger.info(f"📊 Results: {successful_count}/{len(image_paths)} successful ({success_rate:.1f}%)")
-        logger.info(f"⏱️  Total time: {total_time/60:.1f} minutes")
+        logger.info(f"📊 Results: {len(successful_predictions)}/{num_images} successful ({success_rate:.1f}%)")
+        logger.info(f"⏱️  Total time: {total_time / 60:.1f} minutes")
+        
+        return Output(batch_results=Path(output_zip_path), mesh=None)
 
-        self._log_analytics_event("batch_predict_completed", {
-            "total_images": len(image_paths),
-            "successful": successful_count,
-            "failed": len(image_paths) - successful_count,
-            "success_rate_percent": round(success_rate, 1),
-            "total_time_minutes": round(total_time / 60, 1)
-        })
-
-        # Use cog.Path for output as expected by Replicate
-        return Output(
-            mesh=Path(str(batch_zip_path)),
-            batch_results=Path(str(results_json_path))
-        )
-    
-    def _process_batch_parallel(self, image_paths: List[str], parallel_workers: int, **kwargs) -> List[dict]:
-        """Process images in parallel using ThreadPoolExecutor with dedicated model instances"""
-        
-        # Extract and remove custom arg
-        import pathlib
-        output_mesh_dir = kwargs.pop('output_mesh_dir', None)
-        if output_mesh_dir is None:
-            output_mesh_dir = str(pathlib.Path("output/meshes").resolve())
-        else:
-            output_mesh_dir = str(pathlib.Path(output_mesh_dir).resolve())
-        
-        # Pre-load models for all workers before parallel execution
-        logger.info(f"🔧 Pre-loading dedicated models for {parallel_workers} workers...")
-        self._preload_worker_models(parallel_workers)
-        logger.info(f"✅ All {parallel_workers} worker model sets pre-loaded")
-        
-        # Prepare arguments for workers (include worker_id for model assignment)
-        worker_args = [
-            (idx, image_path, output_mesh_dir, kwargs, idx % parallel_workers)
-            for idx, image_path in enumerate(image_paths)
-        ]
-        
-        batch_results = []
-        
-        # Process in batches to manage memory better
-        batch_size = parallel_workers * 2  # Process 2 batches per worker set
-        
-        for batch_start in range(0, len(worker_args), batch_size):
-            batch_end = min(batch_start + batch_size, len(worker_args))
-            current_batch = worker_args[batch_start:batch_end]
-            
-            logger.info(f"🔄 Processing batch {batch_start//batch_size + 1}: images {batch_start + 1}-{batch_end}")
-            
-            # Check VRAM before each batch
-            current_vram = self.vram_monitor.get_available_vram()
-            logger.info(f"💾 VRAM before batch: {current_vram:.1f}GB")
-            
-            if current_vram < 40.0:  # Need substantial VRAM for parallel processing with dedicated models
-                logger.warning("⚠️  Low VRAM detected, falling back to sequential for remaining images")
-                
-                # Process remaining images sequentially
-                remaining_args = worker_args[batch_start:]
-                for idx, image_path, output_dir, kwargs_dict, _ in remaining_args:
-                    metadata = self._process_single_image(image_path, output_dir, idx, **kwargs_dict)
-                    batch_results.append(metadata)
-                break
-            
-            # Execute parallel batch with pre-loaded models
-            with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
-                # Submit all jobs in current batch
-                future_to_args = {
-                    executor.submit(self._process_image_worker, args): args 
-                    for args in current_batch
-                }
-                
-                # Collect results as they complete
-                for future in as_completed(future_to_args):
-                    try:
-                        result = future.result(timeout=600)  # 10 minute timeout per image
-                        batch_results.append(result)
-                    except Exception as e:
-                        # Handle worker failure
-                        args = future_to_args[future]
-                        _, image_path, _, _, _ = args
-                        image_name = os.path.splitext(os.path.basename(image_path))[0]
-                        
-                        error_metadata = {
-                            "input_image": image_name,
-                            "output_mesh": None,
-                            "status": "error",
-                            "duration": 0.0,
-                            "face_count": 0,
-                            "vertex_count": 0,
-                            "error": f"Worker timeout or error: {str(e)}",
-                            "error_type": type(e).__name__
-                        }
-                        batch_results.append(error_metadata)
-                        logger.error(f"❌ Worker failed for {image_name}: {str(e)}")
-            
-            # Cleanup between batches
-            self._cleanup_gpu_memory()
-            time.sleep(1)  # Brief pause between batches
-        
-        # Cleanup all pre-loaded worker models
-        self._cleanup_all_worker_models()
-        
-        return batch_results
-    
     def _process_batch_sequential(self, image_paths: List[str], **kwargs) -> List[dict]:
         """Process images sequentially (fallback method)"""
         import pathlib
