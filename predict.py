@@ -906,6 +906,33 @@ class Predictor(BasePredictor):
             if available_vram > texture_memory_estimate + 5.0:  # 5GB safety buffer
                 # Sufficient VRAM for parallel texture generation
                 logger.info(f"  [Worker-{thread_id}] Generating texture for {image_name} (PARALLEL - {available_vram:.1f}GB available)")
+                
+                # Clear texture pipeline state to prevent worker contamination between images
+                try:
+                    tex_pipeline = worker_models_set['texture']
+                    # Clear any cached states in the render system
+                    if hasattr(tex_pipeline, 'render') and tex_pipeline.render is not None:
+                        # Reset mesh-related state
+                        tex_pipeline.render.vtx_pos = None
+                        tex_pipeline.render.pos_idx = None
+                        if hasattr(tex_pipeline.render, 'vtx_map'):
+                            tex_pipeline.render.vtx_map = None
+                        # Clear texture state
+                        if hasattr(tex_pipeline.render, 'texture'):
+                            tex_pipeline.render.texture = None
+                    
+                    # Clear model pipeline caches if they exist
+                    if hasattr(tex_pipeline, 'models'):
+                        for model_name, model in tex_pipeline.models.items():
+                            if hasattr(model, 'pipeline') and hasattr(model.pipeline, 'unet'):
+                                # Clear UNet cached conditions to prevent state contamination
+                                if hasattr(model.pipeline.unet, '_cached_condition'):
+                                    model.pipeline.unet._cached_condition = {}
+                    
+                    logger.info(f"  [Worker-{thread_id}] Cleared texture pipeline state for {image_name}")
+                except Exception as e:
+                    logger.warning(f"  [Worker-{thread_id}] Failed to clear texture pipeline state: {e}")
+                
                 # Ensure absolute path for texture output to prevent path duplication
                 output_textured_path = str(pathlib.Path(os.path.join(output_dir, f"{image_name}_worker_{thread_id}_textured.obj")).resolve())
                 textured_mesh_path = worker_models_set['texture'](
@@ -919,6 +946,33 @@ class Predictor(BasePredictor):
                 logger.info(f"  [Worker-{thread_id}] Waiting for texture generation slot (VRAM: {available_vram:.1f}GB)")
                 with texture_generation_lock:
                     logger.info(f"  [Worker-{thread_id}] Generating texture for {image_name} (SERIALIZED for VRAM safety)")
+                    
+                    # Clear texture pipeline state to prevent worker contamination between images
+                    try:
+                        tex_pipeline = worker_models_set['texture']
+                        # Clear any cached states in the render system
+                        if hasattr(tex_pipeline, 'render') and tex_pipeline.render is not None:
+                            # Reset mesh-related state
+                            tex_pipeline.render.vtx_pos = None
+                            tex_pipeline.render.pos_idx = None
+                            if hasattr(tex_pipeline.render, 'vtx_map'):
+                                tex_pipeline.render.vtx_map = None
+                            # Clear texture state
+                            if hasattr(tex_pipeline.render, 'texture'):
+                                tex_pipeline.render.texture = None
+                        
+                        # Clear model pipeline caches if they exist
+                        if hasattr(tex_pipeline, 'models'):
+                            for model_name, model in tex_pipeline.models.items():
+                                if hasattr(model, 'pipeline') and hasattr(model.pipeline, 'unet'):
+                                    # Clear UNet cached conditions to prevent state contamination
+                                    if hasattr(model.pipeline.unet, '_cached_condition'):
+                                        model.pipeline.unet._cached_condition = {}
+                        
+                        logger.info(f"  [Worker-{thread_id}] Cleared texture pipeline state for {image_name}")
+                    except Exception as e:
+                        logger.warning(f"  [Worker-{thread_id}] Failed to clear texture pipeline state: {e}")
+                    
                     # Ensure absolute path for texture output to prevent path duplication
                     output_textured_path = str(pathlib.Path(os.path.join(output_dir, f"{image_name}_worker_{thread_id}_textured.obj")).resolve())
                     textured_mesh_path = worker_models_set['texture'](
