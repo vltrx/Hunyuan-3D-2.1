@@ -1501,38 +1501,31 @@ class Predictor(BasePredictor):
         parallel_workers: int = Input(description="Number of parallel workers for batch processing (H100 can handle 2-4)", default=2, ge=1, le=4),
     ) -> Output:
         
-        start_time = time.time()
+        # Centralized output directory management
+        self.output_dir = "output"
+        if os.path.exists(self.output_dir):
+            shutil.rmtree(self.output_dir)
+        os.makedirs(os.path.join(self.output_dir, "meshes"), exist_ok=True)
         
-        # Analytics
+        # Log analytics for every prediction
         self._log_analytics_event("predict_started")
+        
+        # ======================================================================
+        # Route to the correct prediction mode (single, batch, or texture-only)
+        # ======================================================================
 
-        # Determine processing mode based on inputs
         if batch_images:
             return self._predict_batch(
-                batch_images=batch_images,
-                steps=steps,
-                guidance_scale=guidance_scale,
-                max_facenum=max_facenum,
-                num_chunks=num_chunks,
-                seed=seed,
-                octree_resolution=octree_resolution,
-                remove_background=remove_background,
-                prompt=prompt,
-                parallel_workers=parallel_workers
+                batch_images=batch_images, 
+                parallel_workers=parallel_workers, 
+                **locals()
             )
+        elif image:
+            return self._predict_single(**locals())
+        elif mesh:
+            return self._predict_texture_only(**locals())
         else:
-            return self._predict_single(
-                image=image,
-                mesh=mesh,
-                steps=steps,
-                guidance_scale=guidance_scale,
-                max_facenum=max_facenum,
-                num_chunks=num_chunks,
-                seed=seed,
-                octree_resolution=octree_resolution,
-                remove_background=remove_background,
-                prompt=prompt
-            )
+            raise ValueError("You must provide either an 'image', a 'batch_images' ZIP file, or a 'mesh' to texture.")
 
     def _predict_single(self, **kwargs) -> Output:
         """Single image processing mode"""
