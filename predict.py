@@ -106,36 +106,32 @@ def ensure_directory_exists(path):
 def _comprehensive_texture_pipeline_reset(tex_pipeline):
     """Comprehensive reset of all texture generation pipeline state to prevent contamination."""
     try:
-        logger.info("  🧹 Performing comprehensive texture pipeline reset...")
+        logger.info("  🧹 Performing SELECTIVE texture pipeline reset (preserving current image data)...")
         
         # 1. Reset MeshRender state (most critical for geometry contamination)
         if hasattr(tex_pipeline, 'render') and tex_pipeline.render is not None:
             render = tex_pipeline.render
             
-            # Clear all mesh geometry data
-            if hasattr(render, 'vtx_pos'):
-                render.vtx_pos = None
-            if hasattr(render, 'pos_idx'):
-                render.pos_idx = None  
-            if hasattr(render, 'vtx_uv'):
-                render.vtx_uv = None
-            if hasattr(render, 'uv_idx'):
-                render.uv_idx = None
-            if hasattr(render, 'vtx_map'):
-                render.vtx_map = None
+            # DON'T clear mesh geometry data - that's the INPUT for the current image!
+            # The mesh data (vtx_pos, pos_idx, vtx_uv, uv_idx) is specific to current image
+            # Only clear internal caches that could cause cross-image contamination
+            
+            # Clear internal texture processing caches
+            if hasattr(render, 'tex_position'):
+                render.tex_position = None
+            if hasattr(render, 'tex_normal'):
+                render.tex_normal = None
+            if hasattr(render, 'tex_grid'):
+                render.tex_grid = None
+            if hasattr(render, 'texture_indices'):
+                render.texture_indices = None
                 
-            # Clear all texture data
-            if hasattr(render, 'tex'):
-                render.tex = None
-            if hasattr(render, 'tex_mr'):
-                render.tex_mr = None
-            if hasattr(render, 'tex_normalMap'):
-                render.tex_normalMap = None
+            # DON'T clear actual texture data - that's the OUTPUT, not contamination!
+            # The texture storage (tex, tex_mr, tex_normalMap) should remain intact
+            # Only clear internal state that could cause cross-contamination
                 
-            # Clear internal rendering state
-            for attr in ['tex_grid', 'scale_factor', 'mesh_normalize_scale_factor', 'mesh_normalize_scale_center']:
-                if hasattr(render, attr):
-                    setattr(render, attr, None)
+            # DON'T clear mesh-specific state (scale_factor, mesh_normalize_*) - that's for current image!
+            # These are computed for the specific mesh being processed, not contamination state
                     
         # 2. Reset multiview model pipeline state
         if hasattr(tex_pipeline, 'models') and 'multiview_model' in tex_pipeline.models:
@@ -168,7 +164,7 @@ def _comprehensive_texture_pipeline_reset(tex_pipeline):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             
-        logger.info("  ✅ Comprehensive texture pipeline reset completed")
+        logger.info("  ✅ SELECTIVE texture pipeline reset completed (current image data preserved)")
         
     except Exception as e:
         logger.warning(f"  ⚠️ Error during texture pipeline reset: {e}")
