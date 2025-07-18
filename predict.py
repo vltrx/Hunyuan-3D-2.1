@@ -98,6 +98,200 @@ texture_generation_lock = threading.Lock()
 # Global gate to limit heavy shape generation to 1 GPU at a time
 shape_gpu_gate = Semaphore(1)
 
+def ensure_directory_exists(path):
+    """Ensure a directory exists, creating it if necessary."""
+    if not os.path.exists(path):
+        os.makedirs(path, exist_ok=True)
+
+def _comprehensive_texture_pipeline_reset(tex_pipeline):
+    """Comprehensive reset of all texture generation pipeline state to prevent contamination."""
+    try:
+        logger.info("  🧹 Performing comprehensive texture pipeline reset...")
+        
+        # 1. Reset MeshRender state (most critical for geometry contamination)
+        if hasattr(tex_pipeline, 'render') and tex_pipeline.render is not None:
+            render = tex_pipeline.render
+            
+            # Clear all mesh geometry data
+            if hasattr(render, 'vtx_pos'):
+                render.vtx_pos = None
+            if hasattr(render, 'pos_idx'):
+                render.pos_idx = None  
+            if hasattr(render, 'vtx_uv'):
+                render.vtx_uv = None
+            if hasattr(render, 'uv_idx'):
+                render.uv_idx = None
+            if hasattr(render, 'vtx_map'):
+                render.vtx_map = None
+                
+            # Clear all texture data
+            if hasattr(render, 'tex'):
+                render.tex = None
+            if hasattr(render, 'tex_mr'):
+                render.tex_mr = None
+            if hasattr(render, 'tex_normalMap'):
+                render.tex_normalMap = None
+                
+            # Clear internal rendering state
+            for attr in ['tex_grid', 'scale_factor', 'mesh_normalize_scale_factor', 'mesh_normalize_scale_center']:
+                if hasattr(render, attr):
+                    setattr(render, attr, None)
+                    
+        # 2. Reset multiview model pipeline state
+        if hasattr(tex_pipeline, 'models') and 'multiview_model' in tex_pipeline.models:
+            multiview_model = tex_pipeline.models['multiview_model']
+            if hasattr(multiview_model, 'pipeline'):
+                pipeline = multiview_model.pipeline
+                
+                # Clear UNet cached conditions and embeddings
+                if hasattr(pipeline, 'unet'):
+                    # Force clear any cached states in UNet
+                    if hasattr(pipeline.unet, '_cached_condition'):
+                        pipeline.unet._cached_condition = None
+                    if hasattr(pipeline.unet, 'conv_in_cache'):
+                        pipeline.unet.conv_in_cache = None
+                        
+                # Reset scheduler state to prevent lazy wrapper issues
+                if hasattr(pipeline, 'scheduler'):
+                    scheduler = pipeline.scheduler
+                    # Clear any step-dependent state
+                    if hasattr(scheduler, 'timesteps'):
+                        # Don't clear timesteps but clear any cached computations
+                        pass
+                    if hasattr(scheduler, '_step_index'):
+                        scheduler._step_index = None
+                    if hasattr(scheduler, 'model_outputs'):
+                        scheduler.model_outputs = None
+                        
+        # 3. Clear CUDA cache to prevent memory state contamination
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+        logger.info("  ✅ Comprehensive texture pipeline reset completed")
+        
+    except Exception as e:
+        logger.warning(f"  ⚠️ Error during texture pipeline reset: {e}")
+
+def _aggressive_gpu_state_reset(tex_pipeline):
+    """Aggressive GPU state reset specifically for warmed-up GPU contamination issues."""
+    try:
+        logger.info("  🔥 Performing AGGRESSIVE GPU state reset for warmed-up GPU...")
+        
+        # 1. First do standard reset
+        _comprehensive_texture_pipeline_reset(tex_pipeline)
+        
+        # 2. AGGRESSIVE GPU memory management
+        import torch
+        if torch.cuda.is_available():
+            # Force complete GPU memory cleanup
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()  # Clean up inter-process communication
+            
+            # Force garbage collection to free Python references
+            import gc
+            gc.collect()
+            
+            # Additional CUDA cache clearing for warmed-up GPUs
+            torch.cuda.reset_peak_memory_stats()
+            
+        # 3. FORCE MODEL RE-INITIALIZATION (most aggressive approach)
+        # This targets the "warmed up" GPU kernel caching issue
+        if hasattr(tex_pipeline, 'models'):
+            models = tex_pipeline.models
+            
+            # Re-initialize multiview model pipeline components that cache GPU state
+            if 'multiview_model' in models and hasattr(models['multiview_model'], 'pipeline'):
+                pipeline = models['multiview_model'].pipeline
+                
+                # Force scheduler reinitialization to clear warmed-up kernel state
+                if hasattr(pipeline, 'scheduler'):
+                    # Backup scheduler config
+                    scheduler_class = type(pipeline.scheduler)
+                    scheduler_config = pipeline.scheduler.config if hasattr(pipeline.scheduler, 'config') else {}
+                    
+                    # Force new scheduler instance to clear cached GPU kernels
+                    try:
+                        pipeline.scheduler = scheduler_class.from_config(scheduler_config) if scheduler_config else scheduler_class()
+                        logger.info("  🔄 Forced scheduler reinitialization")
+                    except:
+                        logger.warning("  ⚠️ Could not reinitialize scheduler")
+                
+                # Clear VAE decoder caches that persist on warmed GPUs
+                if hasattr(pipeline, 'vae'):
+                    # Force VAE to clear its internal caches
+                    if hasattr(pipeline.vae, 'decoder') and hasattr(pipeline.vae.decoder, 'conv_cache'):
+                        pipeline.vae.decoder.conv_cache = None
+                    
+                # Force UNet to clear warmed-up optimization caches
+                if hasattr(pipeline, 'unet'):
+                    unet = pipeline.unet
+                    # Clear any persistent attention caches
+                    for name, module in unet.named_modules():
+                        if hasattr(module, '_attention_cache'):
+                            module._attention_cache = None
+                        if hasattr(module, '_conv_cache'):
+                            module._conv_cache = None
+                        if hasattr(module, '_cached_weights'):
+                            module._cached_weights = None
+        
+        # 4. FORCE CUDA CONTEXT REFRESH (for warmed-up GPU issues)
+        if torch.cuda.is_available():
+            # This is aggressive - forces CUDA to refresh its context
+            current_device = torch.cuda.current_device()
+            
+            # Temporarily switch device to force context refresh
+            try:
+                if torch.cuda.device_count() > 1:
+                    torch.cuda.set_device((current_device + 1) % torch.cuda.device_count())
+                    torch.cuda.empty_cache()
+                    torch.cuda.set_device(current_device)
+                    logger.info("  🔄 Forced CUDA context refresh")
+            except:
+                pass
+            
+            # Final comprehensive cache clear
+            torch.cuda.empty_cache()
+        
+        logger.info("  ✅ AGGRESSIVE GPU state reset completed")
+        
+    except Exception as e:
+        logger.warning(f"  ⚠️ Error during aggressive GPU state reset: {e}")
+        # Fallback to standard reset
+        _comprehensive_texture_pipeline_reset(tex_pipeline)
+
+class VRAMMonitor:
+    """Utility class for thread-safe CUDA VRAM queries."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+
+    def get_available_vram(self) -> float:
+        """Return available VRAM (GB) on the current CUDA device in a thread-safe way."""
+        with self._lock:
+            if not torch.cuda.is_available():
+                return 0.0
+            device_id = torch.cuda.current_device()
+            total = torch.cuda.get_device_properties(device_id).total_memory / 1024 ** 3
+            allocated = torch.cuda.memory_allocated(device_id) / 1024 ** 3
+            return total - allocated
+
+    def get_used_vram(self) -> float:
+        """Return used VRAM (GB) on the current CUDA device in a thread-safe way."""
+        with self._lock:
+            if not torch.cuda.is_available():
+                return 0.0
+            device_id = torch.cuda.current_device()
+            return torch.cuda.memory_allocated(device_id) / 1024 ** 3
+
+    def check_parallel_safety(self, required_per_worker: float, num_workers: int) -> bool:
+        """Check whether enough free VRAM exists to run <num_workers> jobs that each
+        need <required_per_worker> GB. Adds a small safety buffer."""
+        available = self.get_available_vram()
+        total_required = required_per_worker * num_workers
+        safety_buffer = 4.0  # GB
+        return available >= (total_required + safety_buffer)
+
 # Monkey patch volume decoding to prevent memory collision during parallel processing
 def _patched_latents2mesh(self, latents: torch.FloatTensor, **kwargs):
     """Patched latents2mesh method that serializes volume decoding operations"""
@@ -419,38 +613,6 @@ def create_batch_zip(meshes_dir: str, results_json_path: str, output_zip_path: s
                 if filename.endswith('.glb'):
                     file_path = os.path.join(meshes_dir, filename)
                     zip_ref.write(file_path, f'meshes/{filename}')
-
-class VRAMMonitor:
-    """Utility class for thread-safe CUDA VRAM queries."""
-
-    def __init__(self):
-        self._lock = threading.Lock()
-
-    def get_available_vram(self) -> float:
-        """Return available VRAM (GB) on the current CUDA device in a thread-safe way."""
-        with self._lock:
-            if not torch.cuda.is_available():
-                return 0.0
-            device_id = torch.cuda.current_device()
-            total = torch.cuda.get_device_properties(device_id).total_memory / 1024 ** 3
-            allocated = torch.cuda.memory_allocated(device_id) / 1024 ** 3
-            return total - allocated
-
-    def get_used_vram(self) -> float:
-        """Return used VRAM (GB) on the current CUDA device in a thread-safe way."""
-        with self._lock:
-            if not torch.cuda.is_available():
-                return 0.0
-            device_id = torch.cuda.current_device()
-            return torch.cuda.memory_allocated(device_id) / 1024 ** 3
-
-    def check_parallel_safety(self, required_per_worker: float, num_workers: int) -> bool:
-        """Check whether enough free VRAM exists to run <num_workers> jobs that each
-        need <required_per_worker> GB. Adds a small safety buffer."""
-        available = self.get_available_vram()
-        total_required = required_per_worker * num_workers
-        safety_buffer = 4.0  # GB
-        return available >= (total_required + safety_buffer)
 
 class Predictor(BasePredictor):
     def setup(self) -> None:
@@ -907,31 +1069,8 @@ class Predictor(BasePredictor):
                 # Sufficient VRAM for parallel texture generation
                 logger.info(f"  [Worker-{thread_id}] Generating texture for {image_name} (PARALLEL - {available_vram:.1f}GB available)")
                 
-                # Clear texture pipeline state to prevent worker contamination between images
-                try:
-                    tex_pipeline = worker_models_set['texture']
-                    # Clear any cached states in the render system
-                    if hasattr(tex_pipeline, 'render') and tex_pipeline.render is not None:
-                        # Reset mesh-related state
-                        tex_pipeline.render.vtx_pos = None
-                        tex_pipeline.render.pos_idx = None
-                        if hasattr(tex_pipeline.render, 'vtx_map'):
-                            tex_pipeline.render.vtx_map = None
-                        # Clear texture state
-                        if hasattr(tex_pipeline.render, 'texture'):
-                            tex_pipeline.render.texture = None
-                    
-                    # Clear model pipeline caches if they exist
-                    if hasattr(tex_pipeline, 'models'):
-                        for model_name, model in tex_pipeline.models.items():
-                            if hasattr(model, 'pipeline') and hasattr(model.pipeline, 'unet'):
-                                # Clear UNet cached conditions to prevent state contamination
-                                if hasattr(model.pipeline.unet, '_cached_condition'):
-                                    model.pipeline.unet._cached_condition = {}
-                    
-                    logger.info(f"  [Worker-{thread_id}] Cleared texture pipeline state for {image_name}")
-                except Exception as e:
-                    logger.warning(f"  [Worker-{thread_id}] Failed to clear texture pipeline state: {e}")
+                # AGGRESSIVE state cleanup for warmed-up GPU contamination issues
+                _aggressive_gpu_state_reset(worker_models_set['texture'])
                 
                 # Ensure absolute path for texture output to prevent path duplication
                 output_textured_path = str(pathlib.Path(os.path.join(output_dir, f"{image_name}_worker_{thread_id}_textured.obj")).resolve())
@@ -941,37 +1080,14 @@ class Predictor(BasePredictor):
                     output_mesh_path=output_textured_path
                 )
                 logger.info(f"  [Worker-{thread_id}] Completed PARALLEL texture generation for {image_name}")
+
             else:
-                # Insufficient VRAM - serialize texture generation for safety
-                logger.info(f"  [Worker-{thread_id}] Waiting for texture generation slot (VRAM: {available_vram:.1f}GB)")
+                # Insufficient VRAM - use serialized texture generation
                 with texture_generation_lock:
                     logger.info(f"  [Worker-{thread_id}] Generating texture for {image_name} (SERIALIZED for VRAM safety)")
                     
-                    # Clear texture pipeline state to prevent worker contamination between images
-                    try:
-                        tex_pipeline = worker_models_set['texture']
-                        # Clear any cached states in the render system
-                        if hasattr(tex_pipeline, 'render') and tex_pipeline.render is not None:
-                            # Reset mesh-related state
-                            tex_pipeline.render.vtx_pos = None
-                            tex_pipeline.render.pos_idx = None
-                            if hasattr(tex_pipeline.render, 'vtx_map'):
-                                tex_pipeline.render.vtx_map = None
-                            # Clear texture state
-                            if hasattr(tex_pipeline.render, 'texture'):
-                                tex_pipeline.render.texture = None
-                        
-                        # Clear model pipeline caches if they exist
-                        if hasattr(tex_pipeline, 'models'):
-                            for model_name, model in tex_pipeline.models.items():
-                                if hasattr(model, 'pipeline') and hasattr(model.pipeline, 'unet'):
-                                    # Clear UNet cached conditions to prevent state contamination
-                                    if hasattr(model.pipeline.unet, '_cached_condition'):
-                                        model.pipeline.unet._cached_condition = {}
-                        
-                        logger.info(f"  [Worker-{thread_id}] Cleared texture pipeline state for {image_name}")
-                    except Exception as e:
-                        logger.warning(f"  [Worker-{thread_id}] Failed to clear texture pipeline state: {e}")
+                    # AGGRESSIVE state cleanup for warmed-up GPU contamination issues
+                    _aggressive_gpu_state_reset(worker_models_set['texture'])
                     
                     # Ensure absolute path for texture output to prevent path duplication
                     output_textured_path = str(pathlib.Path(os.path.join(output_dir, f"{image_name}_worker_{thread_id}_textured.obj")).resolve())
@@ -1140,6 +1256,10 @@ class Predictor(BasePredictor):
             # Apply texturing with lazy loading
             logger.info(f"  Generating texture for {image_name}")
             tex_pipeline = _ensure_texture_model_loaded()
+            
+            # AGGRESSIVE state cleanup for warmed-up GPU contamination issues
+            _aggressive_gpu_state_reset(tex_pipeline)
+            
             textured_mesh_path = tex_pipeline(
                 mesh_path=temp_mesh_path,
                 image_path=input_image,
@@ -1301,6 +1421,10 @@ class Predictor(BasePredictor):
                 mesh_obj.export(temp_mesh_path)
 
                 tex_pipeline = _ensure_texture_model_loaded()
+                
+                # AGGRESSIVE state cleanup for warmed-up GPU contamination issues
+                _aggressive_gpu_state_reset(tex_pipeline)
+                
                 textured_mesh_path = tex_pipeline(
                     mesh_path=temp_mesh_path,
                     image_path=input_image,
