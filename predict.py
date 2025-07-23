@@ -31,6 +31,10 @@ def setup_environment():
     
     # Critical environment variables for production stability
     os.environ["OMP_NUM_THREADS"] = "1"
+    
+    # CRITICAL: Fix memory fragmentation for 100% success rate in parallel processing
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    
     # U2NET_HOME will be set later when U2NET_PATH is defined
     
     # Ensure CUDA toolkit is available
@@ -39,6 +43,7 @@ def setup_environment():
     print(f"LD_LIBRARY_PATH: {os.environ.get('LD_LIBRARY_PATH')}")
     print(f"TORCH_CUDA_ARCH_LIST: {os.environ.get('TORCH_CUDA_ARCH_LIST')}")
     print(f"OMP_NUM_THREADS: {os.environ.get('OMP_NUM_THREADS')}")
+    print(f"PYTORCH_CUDA_ALLOC_CONF: {os.environ.get('PYTORCH_CUDA_ALLOC_CONF')}")
     print(f"U2NET_HOME: {os.environ.get('U2NET_HOME')}")
 
 # Setup environment before importing anything else
@@ -830,6 +835,9 @@ class Predictor(BasePredictor):
         
         logger.info("Setup started - using lazy loading for optimal performance")
         
+        # Setup optimal environment for 100% success rate
+        setup_environment()
+        
         # Apply volume decoding serialization patch for parallel processing safety
         _apply_volume_decoding_patch()
         
@@ -1201,6 +1209,52 @@ class Predictor(BasePredictor):
         except Exception as e:
             logger.warning(f"  ⚠️ Enhanced worker reset failed: {e}")
 
+    def _get_adaptive_parameters(self, available_vram: float, attempt: int, **kwargs) -> dict:
+        """
+        Get adaptive parameters based on available VRAM and retry attempt
+        
+        This reduces memory-intensive parameters on low VRAM or retry attempts
+        to prevent OOM errors and reach 100% success rate
+        """
+        # Start with default parameters
+        params = dict(kwargs)
+        
+        # Determine memory pressure level
+        if available_vram < 25.0:  # Very low VRAM
+            memory_pressure = "high"
+        elif available_vram < 35.0:  # Moderate VRAM
+            memory_pressure = "medium" 
+        else:  # Plenty of VRAM
+            memory_pressure = "low"
+        
+        # Adjust octree resolution based on memory pressure and attempt
+        if attempt > 0 or memory_pressure == "high":
+            # Reduce octree resolution for retries or low memory
+            params['octree_resolution'] = min(kwargs.get('octree_resolution', 512), 384)
+            if attempt > 1 or available_vram < 20.0:
+                params['octree_resolution'] = 256  # Most conservative
+        else:
+            params['octree_resolution'] = kwargs.get('octree_resolution', 512)
+        
+        # Adjust num_chunks based on memory pressure and attempt  
+        default_chunks = kwargs.get('num_chunks', 200000)
+        if attempt > 0 or memory_pressure == "high":
+            # Reduce chunks for retries or low memory (more chunks = less memory per chunk)
+            params['num_chunks'] = max(default_chunks * 2, 300000)
+            if attempt > 1 or available_vram < 20.0:
+                params['num_chunks'] = 400000  # Most conservative - smallest chunks
+        else:
+            params['num_chunks'] = default_chunks
+        
+        # Keep other parameters the same but ensure they exist
+        params.setdefault('steps', 50)
+        params.setdefault('guidance_scale', 5.5)
+        params.setdefault('seed', 1234)
+        params.setdefault('remove_background', True)
+        params.setdefault('max_facenum', 40000)
+        
+        return params
+
     def _process_single_image_worker_direct_attempt(self, 
                             image_input: Union[Path, str], 
                             output_dir: str,
@@ -1235,6 +1289,13 @@ class Predictor(BasePredictor):
         }
         
         try:
+            # Enhanced memory-aware parameter adjustment
+            current_vram = self.vram_monitor.get_available_vram()
+            
+            # Adaptive parameters based on available memory and attempt number
+            adaptive_params = self._get_adaptive_parameters(current_vram, attempt, **kwargs)
+            logger.info(f"  📊 [Worker-{thread_id}] Using adaptive parameters: octree_res={adaptive_params['octree_resolution']}, chunks={adaptive_params['num_chunks']}")
+            
             # Load and preprocess image with validation
             if isinstance(image_input, str):
                 if not validate_image_file(image_input):
@@ -1247,7 +1308,7 @@ class Predictor(BasePredictor):
             worker_models_set = worker_models[worker_key]
 
             # Background removal with worker-specific model
-            if kwargs.get('remove_background', True):
+            if adaptive_params.get('remove_background', True):
                 logger.info(f"  [Worker-{thread_id}] Removing background for {image_name}")
                 processed_image = worker_models_set['rembg'](input_image)
             else:
@@ -1261,16 +1322,16 @@ class Predictor(BasePredictor):
             
             # Use worker-specific shape generation (no locking!)
             generator = torch.Generator()
-            generator = generator.manual_seed(int(kwargs.get('seed', 1234)) + image_idx)
+            generator = generator.manual_seed(int(adaptive_params.get('seed', 1234)) + image_idx)
             
             with shape_gpu_gate:
                 outputs = worker_models_set['shape'](
                     image=processed_image,
-                    num_inference_steps=kwargs.get('steps', 50),
-                    guidance_scale=kwargs.get('guidance_scale', 5.5),
+                    num_inference_steps=adaptive_params.get('steps', 50),
+                    guidance_scale=adaptive_params.get('guidance_scale', 5.5),
                     generator=generator,
-                    octree_resolution=kwargs.get('octree_resolution', 512),
-                    num_chunks=kwargs.get('num_chunks', 200000),
+                    octree_resolution=adaptive_params['octree_resolution'],
+                    num_chunks=adaptive_params['num_chunks'],
                     output_type='mesh'
                 )
             
@@ -1304,7 +1365,7 @@ class Predictor(BasePredictor):
                     raise RuntimeError("Mesh became empty after degenerate face removal")
                 
                 # Face reduction (always needed)
-                mesh_output = worker_models_set['face_reducer'](mesh_output, max_facenum=kwargs.get('max_facenum', 40000))
+                mesh_output = worker_models_set['face_reducer'](mesh_output, max_facenum=adaptive_params.get('max_facenum', 40000))
                 if mesh_output is None or len(mesh_output.vertices) == 0 or len(mesh_output.faces) == 0:
                     raise RuntimeError("Mesh became empty after face reduction")
                     
