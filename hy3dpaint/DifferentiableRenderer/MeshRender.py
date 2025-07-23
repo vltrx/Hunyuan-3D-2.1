@@ -1417,22 +1417,3 @@ class MeshRender:
             assert return_float == False
 
         return texture_np
-
-    def clear_mesh(self):
-        """Clear all geometry- and texture-related tensors so the next mesh starts from a clean state."""
-        for _attr in [
-            'vtx_pos',
-            'pos_idx',
-            'vtx_uv',
-            'uv_idx',
-            'vtx_map',
-            'tex',
-            'tex_mr',
-            'tex_normalMap',
-            'tex_position',
-            'tex_normal',
-            'tex_grid',
-            'texture_indices',
-        ]:
-            if hasattr(self, _attr):
-                setattr(self, _attr, None)

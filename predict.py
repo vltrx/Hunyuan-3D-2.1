@@ -237,18 +237,42 @@ def _aggressive_gpu_state_reset(tex_pipeline):
                         
                         # Special handling for UniPC multistep scheduler (source of lazy wrapper error)
                         if 'UniPC' in str(type(pipeline.scheduler)):
-                            # Force clear any internal state that could cause lazy wrapper issues
+                            # ENHANCED: Clear ALL internal state that could cause lazy wrapper issues
                             if hasattr(pipeline.scheduler, 'model_outputs'):
                                 pipeline.scheduler.model_outputs = None
                             if hasattr(pipeline.scheduler, '_step_index'):
                                 pipeline.scheduler._step_index = None
                             if hasattr(pipeline.scheduler, 'lower_order_nums'):
                                 pipeline.scheduler.lower_order_nums = 0
-                            # Clear any matrix caches that could be corrupted
-                            for attr in ['_R', '_b', '_rhos_c']:
+                            
+                            # Clear matrix caches that could be corrupted (key for lazy wrapper fix)
+                            for attr in ['_R', '_b', '_rhos_c', 'bh', 'rhos', 'solver_p']:
                                 if hasattr(pipeline.scheduler, attr):
                                     setattr(pipeline.scheduler, attr, None)
-                            logger.info("  🎯 Applied UniPC-specific lazy wrapper fixes")
+                            
+                            # CRITICAL: Force clearing of any lazy tensor references
+                            for attr in dir(pipeline.scheduler):
+                                if not attr.startswith('_') and hasattr(pipeline.scheduler, attr):
+                                    obj = getattr(pipeline.scheduler, attr)
+                                    if torch.is_tensor(obj) and hasattr(obj, '_is_lazy') and obj._is_lazy:
+                                        setattr(pipeline.scheduler, attr, None)
+                                        logger.info(f"    🧹 Cleared lazy tensor: {attr}")
+                            
+                            # Force PyTorch to clear its lazy evaluation cache
+                            if hasattr(torch, '_lazy'):
+                                try:
+                                    torch._lazy.clear()
+                                except:
+                                    pass
+                            
+                            # Additional PyTorch internal cache clearing for lazy tensors
+                            if hasattr(torch._C, '_clear_lazy_init'):
+                                try:
+                                    torch._C._clear_lazy_init()
+                                except:
+                                    pass
+                                    
+                            logger.info("  🎯 Applied ENHANCED UniPC-specific lazy wrapper fixes")
                             
                         logger.info("  🔄 ULTRA-AGGRESSIVE scheduler reinitialization completed")
                     except Exception as e:
@@ -378,18 +402,48 @@ def _aggressive_shape_generation_reset(shape_pipeline):
                     if hasattr(module, attr):
                         setattr(module, attr, None)
         
-        # 4. Reset Scheduler State
+        # 4. Reset Scheduler State - ENHANCED for timestep corruption issues
         if hasattr(shape_pipeline, 'scheduler'):
             scheduler = shape_pipeline.scheduler
             scheduler_class = type(scheduler)
             scheduler_config = scheduler.config if hasattr(scheduler, 'config') else {}
+            
+            # Store current device for proper placement
+            current_device = next(shape_pipeline.model.parameters()).device if hasattr(shape_pipeline, 'model') else torch.cuda.current_device()
+            
             try:
+                # Complete scheduler reconstruction with device placement
                 shape_pipeline.scheduler = scheduler_class.from_config(scheduler_config) if scheduler_config else scheduler_class()
+                
+                # CRITICAL: Force timestep reinitialization to prevent index errors
+                if hasattr(shape_pipeline.scheduler, 'set_timesteps'):
+                    # Use a standard configuration to ensure timesteps are properly set
+                    shape_pipeline.scheduler.set_timesteps(
+                        num_inference_steps=50,  # Default for shape generation
+                        device=current_device
+                    )
+                    logger.info(f"  ✅ Forced scheduler timestep reinitialization on device {current_device}")
+                
+                # Ensure scheduler is on correct device
+                if hasattr(shape_pipeline.scheduler, 'to'):
+                    shape_pipeline.scheduler.to(current_device)
+                
                 logger.info("  🔄 Forced shape generation scheduler reinitialization")
-            except:
-                for attr in ['_step_index', 'model_outputs', 'sample']:
+            except Exception as scheduler_error:
+                logger.warning(f"  ⚠️ Scheduler reinitialization failed: {scheduler_error}")
+                # Enhanced fallback - manual state clearing with timestep fix
+                for attr in ['_step_index', 'model_outputs', 'sample', 'timesteps', 'sigmas']:
                     if hasattr(scheduler, attr):
                         setattr(scheduler, attr, None)
+                
+                # Force timestep regeneration on fallback
+                try:
+                    if hasattr(scheduler, 'set_timesteps'):
+                        scheduler.set_timesteps(num_inference_steps=50, device=current_device)
+                        logger.info("  🔧 Fallback timestep regeneration completed")
+                except:
+                    logger.warning("  ⚠️ Fallback timestep regeneration also failed")
+                    
                 logger.warning("  ⚠️ Manual scheduler state clear (reinitialization failed)")
         
         # 5. Clear cached trimesh geometry from pipeline object
@@ -1074,11 +1128,94 @@ class Predictor(BasePredictor):
                             worker_key: str,
                             **kwargs) -> dict:
         """
-        Process a single image using pre-loaded worker-specific models (lock-free)
-        Returns metadata dict for the image
+        Process a single image with pre-loaded worker models (for parallel batch processing)
+        Includes enhanced error handling and retry logic for known issues
+        """
+        thread_id = threading.current_thread().ident
+        image_name = os.path.splitext(os.path.basename(image_input))[0]
+        
+        # Enhanced error handling with retry for known issues
+        max_retries = 2  # Allow up to 2 retries for known transient errors
+        for attempt in range(max_retries + 1):
+            try:
+                return self._process_single_image_worker_direct_attempt(
+                    image_input, output_dir, image_idx, worker_key, attempt, **kwargs
+                )
+            except Exception as e:
+                error_str = str(e).lower()
+                is_known_error = (
+                    "lazy wrapper should be called at most once" in error_str or
+                    "index 0 is out of bounds for dimension 0 with size 0" in error_str or
+                    "indices[pos].item()" in error_str
+                )
+                
+                if is_known_error and attempt < max_retries:
+                    logger.warning(f"  ⚠️ [Worker-{thread_id}] Known error on attempt {attempt + 1}/{max_retries + 1}: {str(e)}")
+                    logger.info(f"  🔄 [Worker-{thread_id}] Performing enhanced reset and retry...")
+                    
+                    # Enhanced reset for retry
+                    self._enhanced_worker_reset(worker_key)
+                    time.sleep(1)  # Brief pause before retry
+                    continue
+                else:
+                    # Either not a known error or max retries exceeded
+                    if attempt == max_retries:
+                        logger.error(f"❌ [Worker-{thread_id}] Failed {image_name} after {max_retries + 1} attempts: {str(e)}")
+                    else:
+                        logger.error(f"❌ [Worker-{thread_id}] Failed {image_name} with unknown error: {str(e)}")
+                    
+                    # Return error metadata
+                    return {
+                        "input_image": image_name,
+                        "output_mesh": None,
+                        "status": "error",
+                        "duration": 0.0,
+                        "face_count": 0,
+                        "vertex_count": 0,
+                        "error": str(e),
+                        "error_type": type(e).__name__,
+                        "attempts": attempt + 1
+                    }
+
+    def _enhanced_worker_reset(self, worker_key: str):
+        """Enhanced reset for worker models to address known issues"""
+        try:
+            worker_models_set = worker_models[worker_key]
+            
+            # Reset shape generation model with enhanced scheduler handling
+            if 'shape' in worker_models_set:
+                _aggressive_shape_generation_reset(worker_models_set['shape'])
+            
+            # Reset texture generation model with enhanced UniPC handling
+            if 'texture' in worker_models_set:
+                _aggressive_gpu_state_reset(worker_models_set['texture'])
+            
+            # Force complete GPU memory cleanup
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+            
+            # Force garbage collection
+            import gc
+            gc.collect()
+            
+        except Exception as e:
+            logger.warning(f"  ⚠️ Enhanced worker reset failed: {e}")
+
+    def _process_single_image_worker_direct_attempt(self, 
+                            image_input: Union[Path, str], 
+                            output_dir: str,
+                            image_idx: int,
+                            worker_key: str,
+                            attempt: int,
+                            **kwargs) -> dict:
+        """
+        Single attempt at processing an image (called by retry logic)
         """
         start_time = time.time()
         thread_id = threading.current_thread().ident
+        
+        if attempt > 0:
+            logger.info(f"  🔄 [Worker-{thread_id}] Retry attempt {attempt + 1} for image processing")
         
         # CRITICAL: Always preserve original filename (without extension) for output mesh
         if isinstance(image_input, str):
